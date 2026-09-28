@@ -149,7 +149,7 @@
     @keyframes pulse-stale { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
   
 #pinLock{position:fixed;inset:0;z-index:99999;background:#0b0f14;display:flex;align-items:center;justify-content:center;padding:20px}
-#pinLock.hidden{display:none!important}
+#pinLock.hidden{display:none!important;visibility:hidden;pointer-events:none}
 .pin-box{background:#121820;border:1px solid #1e2a36;border-radius:14px;padding:24px 20px;max-width:340px;width:100%;text-align:center}
 .pin-box h2{margin:0 0 6px;font-size:18px;color:#e8eef4}
 .pin-box p{margin:0 0 14px;font-size:12px;color:#8b9bb0;line-height:1.4}
@@ -4264,77 +4264,11 @@
     if (btnFh) btnFh.onclick = function () {
       var v = (document.getElementById('inpFhToken').value || '').trim();
       try { if (v) localStorage.setItem('smc-fh-token', v); else localStorage.removeItem('smc-fh-token'); } catch (e) {}
-    
-  (function initPinLock() {
-    var KEY = 'smc-oscar-pin-hash';
-    var UNLOCK = 'smc-oscar-unlocked';
-    function hash(s) {
-      var h = 5381;
-      s = 'smc|' + String(s) + '|oscar';
-      for (var i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
-      return (h >>> 0).toString(16);
-    }
-    function hasPin() { try { return !!localStorage.getItem(KEY); } catch (e) { return false; } }
-    function setPin(pin) { try { localStorage.setItem(KEY, hash(pin)); } catch (e) {} }
-    function checkPin(pin) { try { return localStorage.getItem(KEY) === hash(pin); } catch (e) { return false; } }
-    function unlockSession() {
-      try { sessionStorage.setItem(UNLOCK, '1'); } catch (e) {}
-      var el = document.getElementById('pinLock');
-      if (el) el.classList.add('hidden');
-    }
-    function isUnlocked() { try { return sessionStorage.getItem(UNLOCK) === '1'; } catch (e) { return false; } }
-    var lock = document.getElementById('pinLock');
-    if (!lock) return;
-    if (isUnlocked()) { lock.classList.add('hidden'); return; }
-    var hint = document.getElementById('pinHint');
-    var inp = document.getElementById('pinInput');
-    var err = document.getElementById('pinErr');
-    var btn = document.getElementById('pinSubmit');
-    var setup = document.getElementById('pinSetup');
-    var mode = hasPin() ? 'login' : 'create';
-    function refreshUI() {
-      if (mode === 'create') {
-        hint.textContent = 'Crea un PIN (4-8 digitos). Solo se guarda en este dispositivo.';
-        btn.textContent = 'Guardar PIN';
-        if (setup) setup.style.display = 'none';
-      } else if (mode === 'reset') {
-        hint.textContent = 'Escribe: PIN_ACTUAL NUEVO_PIN';
-        btn.textContent = 'Cambiar PIN';
-        if (setup) setup.style.display = 'none';
-      } else {
-        hint.textContent = 'Introduce tu PIN de acceso';
-        btn.textContent = 'Entrar';
-        if (setup) setup.style.display = 'block';
-      }
-      if (err) err.textContent = '';
-      if (inp) { inp.value = ''; inp.focus(); }
-    }
-    if (setup) setup.onclick = function () { mode = 'reset'; refreshUI(); };
-    function submit() {
-      var v = (inp && inp.value || '').trim();
-      if (mode === 'create') {
-        if (!/^\d{4,8}$/.test(v)) { err.textContent = 'Usa 4 a 8 digitos'; return; }
-        setPin(v); unlockSession(); return;
-      }
-      if (mode === 'reset') {
-        var parts = v.split(/\s+/);
-        if (parts.length < 2) { err.textContent = 'Formato: PIN_ACTUAL NUEVO'; return; }
-        if (!checkPin(parts[0])) { err.textContent = 'PIN actual incorrecto'; return; }
-        if (!/^\d{4,8}$/.test(parts[1])) { err.textContent = 'Nuevo PIN: 4-8 digitos'; return; }
-        setPin(parts[1]); unlockSession(); return;
-      }
-      if (!checkPin(v)) { err.textContent = 'PIN incorrecto'; if (inp) inp.value = ''; return; }
-      unlockSession();
-    }
-    if (btn) btn.onclick = submit;
-    if (inp) inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
-    refreshUI();
-  })();
-
-
-  setTimeout(function () {
-    document.addEventListener('click', function (ev) {
-      if (!ev.target || ev.target.id !== 'btnSaveOanda') return;
+      alert(v ? 'Token Finnhub guardado. Recargando…' : 'Token eliminado');
+      if (typeof refreshData === 'function') refreshData();
+    };
+    var btnOa = document.getElementById('btnSaveOanda');
+    if (btnOa) btnOa.onclick = function () {
       var tokEl = document.getElementById('inpOandaToken');
       var envEl = document.getElementById('selOandaEnv');
       var tok = (tokEl && tokEl.value || '').trim();
@@ -4345,18 +4279,12 @@
       } catch (e) {}
       alert(tok ? 'Token OANDA guardado. Recargando…' : 'Token eliminado');
       if (typeof refreshData === 'function') refreshData();
-    });
-  }, 0);
-  refreshData();
-      alert(v ? 'Token guardado. Recargando LIVE…' : 'Token eliminado');
     };
     var btnRefresh = document.getElementById('btnForceRefresh');
     if (btnRefresh) btnRefresh.onclick = function () {
       btnRefresh.textContent = 'Actualizando…';
       btnRefresh.disabled = true;
-      loadCandlesOnce(true).then(function () {
-        renderTools();
-      });
+      loadCandlesOnce(true).then(function () { renderTools(); });
     };
   }
 
@@ -5655,6 +5583,122 @@
   if (_ba) _ba.onclick = function (e) { e.preventDefault(); e.stopPropagation(); toggleAlerts(); };
   updateAlertChip();
   updateLayerChips();
+
+  /* PIN lock — boot */
+  (function initPinLock() {
+    var KEY = 'smc-oscar-pin-hash';
+    var UNLOCK = 'smc-oscar-unlocked';
+    function hash(s) {
+      var h = 5381;
+      s = 'smc|' + String(s) + '|oscar';
+      for (var i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
+      return (h >>> 0).toString(16);
+    }
+    function hasPin() { try { return !!localStorage.getItem(KEY); } catch (e) { return false; } }
+    function setPin(pin) { try { localStorage.setItem(KEY, hash(pin)); } catch (e) {} }
+    function checkPin(pin) { try { return localStorage.getItem(KEY) === hash(pin); } catch (e) { return false; } }
+    function unlockSession() {
+      try { sessionStorage.setItem(UNLOCK, '1'); } catch (e) {}
+      var el = document.getElementById('pinLock');
+      if (el) {
+        el.classList.add('hidden');
+        el.style.display = 'none';
+      }
+    }
+    function isUnlocked() { try { return sessionStorage.getItem(UNLOCK) === '1'; } catch (e) { return false; } }
+
+    function bind() {
+      var lock = document.getElementById('pinLock');
+      if (!lock) return;
+      if (isUnlocked()) {
+        lock.classList.add('hidden');
+        lock.style.display = 'none';
+        return;
+      }
+      lock.style.display = 'flex';
+      var hint = document.getElementById('pinHint');
+      var inp = document.getElementById('pinInput');
+      var err = document.getElementById('pinErr');
+      var btn = document.getElementById('pinSubmit');
+      var setup = document.getElementById('pinSetup');
+      var mode = hasPin() ? 'login' : 'create';
+
+      function refreshUI() {
+        if (!hint || !btn) return;
+        if (mode === 'create') {
+          hint.textContent = 'Crea un PIN (4-8 digitos). Solo se guarda en este dispositivo.';
+          btn.textContent = 'Guardar PIN y entrar';
+          if (setup) setup.style.display = 'none';
+        } else if (mode === 'reset') {
+          hint.textContent = 'Escribe: PIN_ACTUAL NUEVO_PIN';
+          btn.textContent = 'Cambiar PIN';
+          if (setup) setup.style.display = 'none';
+        } else {
+          hint.textContent = 'Introduce tu PIN de acceso';
+          btn.textContent = 'Entrar';
+          if (setup) setup.style.display = 'block';
+        }
+        if (err) err.textContent = '';
+        if (inp) { try { inp.focus(); } catch (e) {} }
+      }
+
+      function submit(ev) {
+        if (ev) { try { ev.preventDefault(); ev.stopPropagation(); } catch (e) {} }
+        var v = (inp && inp.value || '').trim();
+        if (mode === 'create') {
+          if (!/^\d{4,8}$/.test(v)) {
+            if (err) err.textContent = 'Usa 4 a 8 digitos (solo numeros)';
+            return;
+          }
+          setPin(v);
+          unlockSession();
+          return;
+        }
+        if (mode === 'reset') {
+          var parts = v.split(/\s+/);
+          if (parts.length < 2) { if (err) err.textContent = 'Formato: PIN_ACTUAL NUEVO'; return; }
+          if (!checkPin(parts[0])) { if (err) err.textContent = 'PIN actual incorrecto'; return; }
+          if (!/^\d{4,8}$/.test(parts[1])) { if (err) err.textContent = 'Nuevo PIN: 4-8 digitos'; return; }
+          setPin(parts[1]);
+          unlockSession();
+          return;
+        }
+        if (!v) { if (err) err.textContent = 'Escribe tu PIN'; return; }
+        if (!checkPin(v)) {
+          if (err) err.textContent = 'PIN incorrecto';
+          if (inp) inp.value = '';
+          return;
+        }
+        unlockSession();
+      }
+
+      if (setup) {
+        setup.onclick = function (e) {
+          e.preventDefault();
+          mode = 'reset';
+          if (inp) inp.value = '';
+          refreshUI();
+        };
+      }
+      if (btn) {
+        btn.onclick = submit;
+        btn.ontouchend = function (e) { e.preventDefault(); submit(e); };
+      }
+      if (inp) {
+        inp.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') submit(e);
+        });
+      }
+      refreshUI();
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', bind);
+    } else {
+      bind();
+    }
+  })();
+
   refreshData();
   setTimeout(function () { if (state.live) startForexWS(); }, 2000);
 
