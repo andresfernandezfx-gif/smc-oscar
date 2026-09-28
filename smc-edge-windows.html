@@ -1028,120 +1028,270 @@
   }
 
 
-  function detectStructuralRange(candles, swings, atr, tf) {
-    // Spec "En SMC": rango entre swings confirmados + displacement, estados ACTIVE/BROKEN
-    if (!swings || swings.length < 2 || !candles || candles.length < 10) {
-      return null;
-    }
+  function detectStructuralRange(candles, swings, atr, tf, bosEvents) {
+    // Rango operativo SMC v3: extremos estructurales fuertes (no máximos/mínimos locales)
+    // - Swing Low: mínimo que originó CHoCH/BOS alcista (preferible con sweep de liquidez)
+    // - Swing High: máximo absoluto previo a un retroceso confirmado (rotura interna a la baja)
+    // - Expansión dinámica del HH mientras no haya ruptura de estructura interna bajista
+    // - Invalidación: cierre de cuerpo más allá del extremo opuesto
+    if (!candles || candles.length < 12 || !swings || swings.length < 2) return null;
+    atr = atr || calcATR(candles);
+    if (!(atr > 0)) return null;
+
     var highs = swings.filter(function (s) { return s.kind === 'H'; });
     var lows = swings.filter(function (s) { return s.kind === 'L'; });
-    if (highs.length < 1 || lows.length < 1) return null;
+    if (!highs.length || !lows.length) return null;
 
-    // Candidatos: últimos swings externos con separación mínima
-    var minSpan = atr * 1.5;
-    var best = null;
-    var hi, lo, i, j, span, score, fromIdx, toIdx, status, lastPx;
-    lastPx = candles[candles.length - 1].close;
+    bosEvents = bosEvents || [];
+    var lastPx = candles[candles.length - 1].close;
+    var lastBar = candles[candles.length - 1];
+    var minSpan = atr * 1.8;
 
-    // Preferir el rango más reciente que aún contenga precio o sea el dealing activo
-    for (i = highs.length - 1; i >= 0; i--) {
-      for (j = lows.length - 1; j >= 0; j--) {
-        hi = highs[i]; lo = lows[j];
-        span = hi.price - lo.price;
-        if (span < minSpan) continue;
-        // orden temporal: ambos deben formar un tramo coherente
-        fromIdx = Math.min(hi.idx, lo.idx);
-        toIdx = Math.max(hi.idx, lo.idx);
-        if (toIdx - fromIdx < 3) continue;
-
-        score = 40;
-        // desplazamiento desde extremos
-        var k, moved = false;
-        for (k = hi.idx + 1; k < Math.min(candles.length, hi.idx + 8); k++) {
-          if (hi.price - candles[k].close >= atr * 0.8) { moved = true; score += 15; break; }
+    // —— 1) Anclas estructurales desde BOS/CHoCH ——
+    // CHoCH/BOS up → el swing low roto (o el mínimo del impulso) es origen alcista
+    // CHoCH/BOS down → el swing high es origen bajista
+    var bullAnchors = []; // { lowPrice, lowIdx, confirmIdx }
+    var bearAnchors = []; // { highPrice, highIdx, confirmIdx }
+    var e, si, sw;
+    for (var bi = 0; bi < bosEvents.length; bi++) {
+      e = bosEvents[bi];
+      if (!e || e.idx == null) continue;
+      if ((e.type === 'CHoCH' || e.type === 'MSS' || e.type === 'BOS') && e.dir === 'up') {
+        // mínimo estructural más cercano antes de la confirmación
+        var bestL = null;
+        for (si = 0; si < lows.length; si++) {
+          sw = lows[si];
+          if (sw.idx < e.idx && (!bestL || sw.idx > bestL.idx)) bestL = sw;
         }
-        for (k = lo.idx + 1; k < Math.min(candles.length, lo.idx + 8); k++) {
-          if (candles[k].close - lo.price >= atr * 0.8) { moved = true; score += 15; break; }
+        if (bestL) {
+          // bonus si hubo barrido (mecha bajo un low previo)
+          var swept = false;
+          var prevLow = null;
+          for (si = 0; si < lows.length; si++) {
+            if (lows[si].idx < bestL.idx) prevLow = lows[si];
+          }
+          if (prevLow && bestL.price < prevLow.price) swept = true;
+          bullAnchors.push({
+            lowPrice: bestL.price, lowIdx: bestL.idx, confirmIdx: e.idx,
+            strength: (e.type === 'MSS' ? 30 : e.type === 'CHoCH' ? 25 : 18) + (swept ? 12 : 0)
+          });
         }
-        // swings de tipo externo HH/LL ganan peso
-        if (hi.type === 'HH' || hi.type === 'LH') score += 8;
-        if (lo.type === 'LL' || lo.type === 'HL') score += 8;
-        // preferir rangos recientes
-        score += Math.max(0, 20 - (candles.length - toIdx) * 0.3);
+      }
+      if ((e.type === 'CHoCH' || e.type === 'MSS' || e.type === 'BOS') && e.dir === 'down') {
+        var bestH = null;
+        for (si = 0; si < highs.length; si++) {
+          sw = highs[si];
+          if (sw.idx < e.idx && (!bestH || sw.idx > bestH.idx)) bestH = sw;
+        }
+        if (bestH) {
+          bearAnchors.push({
+            highPrice: bestH.price, highIdx: bestH.idx, confirmIdx: e.idx,
+            strength: (e.type === 'MSS' ? 30 : e.type === 'CHoCH' ? 25 : 18)
+          });
+        }
+      }
+    }
 
-        if (!best || score > best.score) {
-          best = {
-            high: hi.price, low: lo.price, highIdx: hi.idx, lowIdx: lo.idx,
-            fromIdx: fromIdx, toIdx: toIdx, score: score, span: span
+    // —— 2) Confirmar Swing High: pico absoluto + rotura de mínimo interno posterior ——
+    // Un HH solo se "fija" cuando el precio cierra por debajo del último swing low interno tras ese high
+    function isConfirmedHigh(h) {
+      // buscar un low posterior y un cierre por debajo de ese low
+      var laterLows = lows.filter(function (l) { return l.idx > h.idx; });
+      if (!laterLows.length) return false; // aún no hay retroceso confirmado
+      var firstInternal = laterLows[0];
+      for (var k = firstInternal.idx; k < candles.length; k++) {
+        if (candles[k].close < firstInternal.price) return true;
+      }
+      // también si hubo BOS/CHoCH down después del high
+      for (var b = 0; b < bosEvents.length; b++) {
+        var ev = bosEvents[b];
+        if (ev.idx > h.idx && (ev.type === 'BOS' || ev.type === 'CHoCH' || ev.type === 'MSS') && ev.dir === 'down') return true;
+      }
+      return false;
+    }
+
+    function isConfirmedLow(l) {
+      var laterHighs = highs.filter(function (h) { return h.idx > l.idx; });
+      if (!laterHighs.length) return false;
+      var firstH = laterHighs[0];
+      for (var k = firstH.idx; k < candles.length; k++) {
+        if (candles[k].close > firstH.price) return true;
+      }
+      for (var b = 0; b < bosEvents.length; b++) {
+        var ev = bosEvents[b];
+        if (ev.idx > l.idx && (ev.type === 'BOS' || ev.type === 'CHoCH' || ev.type === 'MSS') && ev.dir === 'up') return true;
+      }
+      return false;
+    }
+
+    // —— 3) Elegir par Swing High / Swing Low del dealing range activo ——
+    var candidate = null;
+
+    // Preferir ancla del último CHoCH/BOS relevante
+    if (bullAnchors.length) {
+      var ba = bullAnchors[bullAnchors.length - 1];
+      // HH: máximo absoluto DESPUÉS del low de origen y ANTES del último cierre, preferible confirmado
+      var maxH = null;
+      for (si = 0; si < highs.length; si++) {
+        sw = highs[si];
+        if (sw.idx > ba.lowIdx && sw.price > (maxH ? maxH.price : -Infinity)) maxH = sw;
+      }
+      // si precio aún hace higher high sin rotura interna bajista → expandir al high real de velas
+      var absHigh = maxH ? maxH.price : ba.lowPrice;
+      var absHighIdx = maxH ? maxH.idx : ba.lowIdx;
+      for (var c = ba.lowIdx; c < candles.length; c++) {
+        if (candles[c].high > absHigh) {
+          // solo actualizar si no hay rotura confirmada de estructura bajista desde ese high
+          absHigh = candles[c].high;
+          absHighIdx = c;
+        }
+      }
+      // si el high aún no está confirmado por retroceso, sigue siendo válido como RH dinámico
+      if (absHigh - ba.lowPrice >= minSpan) {
+        candidate = {
+          high: absHigh, low: ba.lowPrice,
+          highIdx: absHighIdx, lowIdx: ba.lowIdx,
+          score: ba.strength + 40,
+          source: 'BULL_ANCHOR',
+          confirmedHigh: maxH ? isConfirmedHigh(maxH) : false
+        };
+      }
+    }
+
+    if (bearAnchors.length) {
+      var baa = bearAnchors[bearAnchors.length - 1];
+      var minL = null;
+      for (si = 0; si < lows.length; si++) {
+        sw = lows[si];
+        if (sw.idx > baa.highIdx && sw.price < (minL ? minL.price : Infinity)) minL = sw;
+      }
+      var absLow = minL ? minL.price : baa.highPrice;
+      var absLowIdx = minL ? minL.idx : baa.highIdx;
+      for (var d = baa.highIdx; d < candles.length; d++) {
+        if (candles[d].low < absLow) {
+          absLow = candles[d].low;
+          absLowIdx = d;
+        }
+      }
+      if (baa.highPrice - absLow >= minSpan) {
+        var scoreB = baa.strength + 40;
+        if (!candidate || scoreB >= candidate.score) {
+          candidate = {
+            high: baa.highPrice, low: absLow,
+            highIdx: baa.highIdx, lowIdx: absLowIdx,
+            score: scoreB,
+            source: 'BEAR_ANCHOR',
+            confirmedHigh: true
           };
         }
       }
-      if (best && best.score >= 70) break; // ya hay uno sólido
-    }
-    if (!best || best.score < 45) return null;
-
-    var eq = (best.high + best.low) / 2;
-    var rng = best.high - best.low;
-    var zone = lastPx > eq ? 'PREMIUM' : (lastPx < eq ? 'DISCOUNT' : 'EQUILIBRIUM');
-    // OTE 62-79% desde high hacia low
-    var oteTop = best.high - rng * 0.62;
-    var oteBot = best.high - rng * 0.79;
-    var oteMid = best.high - rng * 0.705;
-
-    // Estado del rango
-    status = 'ACTIVE';
-    var lastClose = lastPx;
-    // BROKEN si cierre decisivo fuera
-    if (lastClose > best.high + atr * 0.15) status = 'EXPANDING';
-    else if (lastClose < best.low - atr * 0.15) status = 'EXPANDING';
-    // si precio está claramente fuera del rango antiguo
-    var maxH = -Infinity, minL = Infinity, m;
-    for (m = best.toIdx; m < candles.length; m++) {
-      if (candles[m].high > maxH) maxH = candles[m].high;
-      if (candles[m].low < minL) minL = candles[m].low;
-    }
-    if (maxH > best.high + atr * 0.25 || minL < best.low - atr * 0.25) {
-      status = 'EXPANDING';
     }
 
-    // Si precio rompió el rango: reconstruir dealing range con swings recientes (no dejar RH/RL muertos)
-    var actHigh = best.high, actLow = best.low;
-    var priceOutside = lastPx > best.high + atr * 0.1 || lastPx < best.low - atr * 0.1;
-    if (status === 'EXPANDING' || priceOutside) {
-      var look = Math.min(6, Math.max(2, highs.length));
-      var recentH = highs.slice(-look);
-      var recentL = lows.slice(-look);
-      if (recentH.length && recentL.length) {
-        actHigh = Math.max.apply(null, recentH.map(function (s) { return s.price; }));
-        actLow = Math.min.apply(null, recentL.map(function (s) { return s.price; }));
-        // si aún el precio está fuera, extender al extremo actual
-        if (lastPx > actHigh) actHigh = lastPx;
-        if (lastPx < actLow) actLow = lastPx;
-        if (actHigh > actLow + atr * 0.5) {
-          status = priceOutside ? 'ACTIVE' : 'EXPANDING';
-          eq = (actHigh + actLow) / 2;
-          rng = actHigh - actLow;
-          zone = lastPx > eq ? 'PREMIUM' : (lastPx < eq ? 'DISCOUNT' : 'EQUILIBRIUM');
-          oteTop = actHigh - rng * 0.62;
-          oteBot = actHigh - rng * 0.79;
-          oteMid = actHigh - rng * 0.705;
-          best.highIdx = recentH[recentH.length - 1].idx;
-          best.lowIdx = recentL[recentL.length - 1].idx;
-          best.fromIdx = Math.min(best.highIdx, best.lowIdx);
-        } else {
-          actHigh = best.high; actLow = best.low; status = 'ACTIVE';
+    // Fallback: swings externos confirmados (no locales)
+    if (!candidate) {
+      var confH = highs.filter(isConfirmedHigh);
+      var confL = lows.filter(isConfirmedLow);
+      // si no hay confirmados, usar los más recientes externos con mayor span
+      var useH = confH.length ? confH : highs.slice(-4);
+      var useL = confL.length ? confL : lows.slice(-4);
+      var best = null;
+      for (var i = useH.length - 1; i >= 0; i--) {
+        for (var j = useL.length - 1; j >= 0; j--) {
+          var hi = useH[i], lo = useL[j];
+          var span = hi.price - lo.price;
+          if (span < minSpan) continue;
+          if (Math.abs(hi.idx - lo.idx) < 3) continue;
+          var sc = 35;
+          if (confH.indexOf(hi) >= 0) sc += 20;
+          if (confL.indexOf(lo) >= 0) sc += 20;
+          // preferir el más reciente que aún "contenga" o esté cerca del precio
+          var mid = (hi.price + lo.price) / 2;
+          if (lastPx <= hi.price + atr * 0.3 && lastPx >= lo.price - atr * 0.3) sc += 15;
+          sc += Math.max(0, 15 - (candles.length - Math.max(hi.idx, lo.idx)) * 0.2);
+          if (!best || sc > best.score) {
+            best = {
+              high: hi.price, low: lo.price, highIdx: hi.idx, lowIdx: lo.idx,
+              score: sc, source: 'CONFIRMED_SWINGS', confirmedHigh: confH.indexOf(hi) >= 0
+            };
+          }
+        }
+      }
+      candidate = best;
+    }
+
+    if (!candidate || candidate.score < 40) return null;
+
+    // —— 4) Expansión dinámica del HH mientras no haya BOS/CHoCH bajista tras el high ——
+    var actHigh = candidate.high;
+    var actLow = candidate.low;
+    var actHighIdx = candidate.highIdx;
+    var actLowIdx = candidate.lowIdx;
+    var brokenDown = false;
+    for (var b2 = 0; b2 < bosEvents.length; b2++) {
+      var ev2 = bosEvents[b2];
+      if (ev2.idx > actHighIdx && (ev2.type === 'BOS' || ev2.type === 'CHoCH' || ev2.type === 'MSS') && ev2.dir === 'down') {
+        brokenDown = true;
+        break;
+      }
+    }
+    if (!brokenDown) {
+      for (var x = Math.max(actHighIdx, actLowIdx); x < candles.length; x++) {
+        if (candles[x].high > actHigh) {
+          actHigh = candles[x].high;
+          actHighIdx = x;
         }
       }
     }
+    // Expansión del LL en estructura bajista sin BOS alcista
+    var brokenUp = false;
+    for (var b3 = 0; b3 < bosEvents.length; b3++) {
+      var ev3 = bosEvents[b3];
+      if (ev3.idx > actLowIdx && (ev3.type === 'BOS' || ev3.type === 'CHoCH' || ev3.type === 'MSS') && ev3.dir === 'up') {
+        brokenUp = true;
+        break;
+      }
+    }
+    if (!brokenUp && candidate.source === 'BEAR_ANCHOR') {
+      for (var y = Math.max(actHighIdx, actLowIdx); y < candles.length; y++) {
+        if (candles[y].low < actLow) {
+          actLow = candles[y].low;
+          actLowIdx = y;
+        }
+      }
+    }
+
+    // —— 5) Invalidación por cierre de cuerpo fuera del rango ——
+    var status = 'ACTIVE';
+    if (lastBar.close > actHigh + atr * 0.12) {
+      // rompió RH con cuerpo → buscar nuevo high o marcar BROKEN/EXPANDING
+      status = 'EXPANDING';
+      actHigh = Math.max(actHigh, lastBar.high);
+      actHighIdx = candles.length - 1;
+    } else if (lastBar.close < actLow - atr * 0.12) {
+      status = 'EXPANDING';
+      actLow = Math.min(actLow, lastBar.low);
+      actLowIdx = candles.length - 1;
+    }
+    // Si el span se desmorona, invalidar
+    if (actHigh - actLow < atr * 1.2) return null;
+
+    var eq = (actHigh + actLow) / 2;
+    var rng = actHigh - actLow;
+    var zone = lastPx > eq ? 'PREMIUM' : (lastPx < eq ? 'DISCOUNT' : 'EQUILIBRIUM');
+    // OTE: 61.8%–79% del rango desde el extremo de prima (para shorts desde high, longs desde low se invierte en consumidor)
+    var oteTop = actHigh - rng * 0.618;
+    var oteBot = actHigh - rng * 0.79;
+    var oteMid = actHigh - rng * 0.704;
 
     var operable = (status === 'ACTIVE' || status === 'EXPANDING') && rng >= atr * 1.2;
 
     return {
-      rangeID: 'SR_' + best.fromIdx + '_' + best.toIdx,
+      rangeID: 'SR_' + actLowIdx + '_' + actHighIdx,
       timeframe: tf || '15m',
       high: actHigh,
       low: actLow,
       equilibrium: eq,
+      eq: eq,
       zone: zone,
       premiumZone: { top: actHigh, bot: eq },
       discountZone: { top: eq, bot: actLow },
@@ -1149,13 +1299,18 @@
       oteHigh: Math.max(oteTop, oteBot),
       oteMid: oteMid,
       status: status,
-      strengthScore: Math.min(100, Math.round(best.score)),
+      strengthScore: Math.min(100, Math.round(candidate.score)),
       operable: operable,
-      highIdx: best.highIdx,
-      lowIdx: best.lowIdx,
-      fromIdx: best.fromIdx,
-      // legacy compat for detectDealingRange consumers
-      eq: eq
+      highIdx: actHighIdx,
+      lowIdx: actLowIdx,
+      fromIdx: Math.min(actHighIdx, actLowIdx),
+      source: candidate.source || 'STRUCT',
+      confirmedHigh: !!candidate.confirmedHigh,
+      // Strong/Weak labels SMC
+      strongHigh: brokenDown,   // high ya defendido/roto a la baja = strong high (liquidez tomada arriba)
+      weakHigh: !brokenDown,    // high aún no confirmado por ruptura interna
+      strongLow: brokenUp,
+      weakLow: !brokenUp
     };
   }
 
@@ -1383,6 +1538,34 @@
     var zoneOk = false;
     if (bias === 'BULLISH' && (range.zone === 'DISCOUNT' || range.zone === 'EQUILIBRIUM')) zoneOk = true;
     if (bias === 'BEARISH' && (range.zone === 'PREMIUM' || range.zone === 'EQUILIBRIUM')) zoneOk = true;
+
+    // MTF: compras en discount en 15m solo si macro no es BEARISH (si lo es → contra-tendencia)
+    var mtfMacro = null;
+    try {
+      if (state.mtf && state.mtf.layers) {
+        mtfMacro = (state.mtf.layers['4h'] && state.mtf.layers['4h'].bias) ||
+                   (state.mtf.layers['1h'] && state.mtf.layers['1h'].bias);
+      }
+    } catch (eM) {}
+    if (bias === 'BULLISH' && range.zone === 'DISCOUNT' && mtfMacro === 'BEARISH') {
+      conf.push('Contra-tendencia MTF (macro BEARISH)');
+      reasons.push('Rango 15m en DISCOUNT pero 4H/1H BEARISH — setup de compra = alto riesgo / contra-tendencia');
+      score -= 25;
+      if (score < 50) {
+        // no proyectar sniper contra macro
+      }
+    }
+    if (bias === 'BEARISH' && range.zone === 'PREMIUM' && mtfMacro === 'BULLISH') {
+      conf.push('Contra-tendencia MTF (macro BULLISH)');
+      reasons.push('Rango 15m en PREMIUM pero 4H/1H BULLISH — venta contra-tendencia / alto riesgo');
+      score -= 25;
+    }
+    if (bias === 'BULLISH' && range.zone === 'DISCOUNT' && (mtfMacro === 'BULLISH' || !mtfMacro)) {
+      conf.push('Discount alineado con macro');
+    }
+    if (bias === 'BEARISH' && range.zone === 'PREMIUM' && (mtfMacro === 'BEARISH' || !mtfMacro)) {
+      conf.push('Premium alineado con macro');
+    }
     // Setup limit: si hay OB/FVG en zona ideal aunque precio aún no llegó, se valida después del PD scan
     if (zoneOk) {
       score += 10;
@@ -1904,7 +2087,7 @@
           continue;
         }
         st = detectStructure(candles, tf === '5m' ? '15m' : tf);
-        range = detectStructuralRange(candles, st.swings, st.atr, tf) || detectDealingRange(st.swings, candles[candles.length - 1].close);
+        range = detectStructuralRange(candles, st.swings, st.atr, tf, st.bosEvents) || detectDealingRange(st.swings, candles[candles.length - 1].close);
         zone = range ? (range.zone || '—') : '—';
         layers[tf] = {
           bias: st.bias || 'NEUTRAL',
@@ -2325,7 +2508,7 @@
     var st = detectStructure(candles, tf);
     var liq = detectLiquidity(candles, st.swings, st.atr);
     var lastPx = candles[candles.length - 1].close;
-    var structural = detectStructuralRange(candles, st.swings, st.atr, tf);
+    var structural = detectStructuralRange(candles, st.swings, st.atr, tf, st.bosEvents);
     var range = structural || detectDealingRange(st.swings, lastPx);
     var fvgs = detectFVGs(candles);
     var obs = detectOBs(candles);
@@ -3610,11 +3793,14 @@
     html += '<div class="stat"><div class="val">' + js.wins + '/' + js.losses + '</div><div class="lbl">W/L</div></div></div>';
     html += '<div class="card" style="margin-bottom:10px"><div style="font-weight:700;margin-bottom:8px">Telegram (gratis)</div>';
     html += '<p style="font-size:11px;color:var(--muted);margin:0 0 8px">BotFather → /newbot → token. Chat ID con @userinfobot</p>';
-    html += '<input id="inpTgToken" placeholder="Bot token" value="' + escapeHtml((state.telegram && state.telegram.token) || '') + '" style="margin-bottom:6px">';
-    html += '<input id="inpTgChat" placeholder="Chat ID" value="' + escapeHtml((state.telegram && state.telegram.chatId) || '') + '" style="margin-bottom:6px">';
+    html += '<input id="inpTgToken" placeholder="Bot token (123456:AA...)" value="' + escapeHtml((state.telegram && state.telegram.token) || '') + '" style="margin-bottom:6px" autocomplete="off">';
+    html += '<input id="inpTgChat" placeholder="Chat ID (solo números)" value="' + escapeHtml((state.telegram && state.telegram.chatId) || '') + '" style="margin-bottom:6px" inputmode="numeric">';
+    html += '<p style="font-size:11px;color:var(--muted);margin:0 0 8px">1) @BotFather → token · 2) Abre tu bot y pulsa <b>Start</b> · 3) @userinfobot → Chat ID</p>';
     html += '<div class="form-row"><button type="button" class="btn ' + (state.telegram && state.telegram.enabled ? 'btn-green' : 'btn-outline') + '" id="btnTgToggle">' + (state.telegram && state.telegram.enabled ? 'Telegram ON' : 'Telegram OFF') + '</button>';
     html += '<button type="button" class="btn btn-outline" id="btnTgTest">Probar</button>';
-    html += '<button type="button" class="btn btn-outline" id="btnExportCsv">CSV</button></div></div>';
+    html += '<button type="button" class="btn btn-outline" id="btnTgOpen">Abrir envío</button>';
+    html += '<button type="button" class="btn btn-outline" id="btnExportCsv">CSV</button></div>';
+    html += '<div id="tgStatus" style="font-size:11px;color:var(--muted);margin-top:6px"></div></div>';
     html += '<div class="card"><div style="font-weight:700;margin-bottom:10px">Nuevo Trade</div><div class="form-row">';
     html += '<button type="button" class="btn ' + (state.direction === 'LONG' ? 'btn-green' : 'btn-outline') + '" id="btnLong">LONG</button>';
     html += '<button type="button" class="btn ' + (state.direction === 'SHORT' ? 'btn-red' : 'btn-outline') + '" id="btnShort">SHORT</button></div><div class="form-row">';
@@ -3707,17 +3893,36 @@
       renderJournal();
     };
     if (btnTgTest) btnTgTest.onclick = function () {
-      state.telegram.token = (tgTok && tgTok.value || '').trim();
-      state.telegram.chatId = (tgChat && tgChat.value || '').trim();
+      state.telegram.token = (tgTok && tgTok.value || '').trim().replace(/\s+/g, '');
+      state.telegram.chatId = (tgChat && tgChat.value || '').trim().replace(/\s+/g, '');
       saveTelegramPrefs();
-      var was = state.telegram.enabled;
-      state.telegram.enabled = true;
-      sendTelegram('<b>SMC Oscar</b>\nTest OK · ' + (state.pair || '') + ' · ' + new Date().toLocaleString()).then(function (ok) {
-        state.telegram.enabled = was;
-        alert(ok
-          ? 'Peticion enviada. Revisa Telegram (@SmcOscarbot): deberia llegar el mensaje de prueba.\n\nSi no llega: 1) Abre el bot y pulsa Start  2) Chat ID correcto  3) Token nuevo (revoca el anterior si lo compartiste)'
-          : 'Fallo al enviar. Revisa token, chat ID y que hayas pulsado Start en el bot.');
+      var st = document.getElementById('tgStatus');
+      if (st) st.textContent = 'Validando bot…';
+      telegramGetMe().then(function (me) {
+        if (st) {
+          st.textContent = me ? ('Bot OK: @' + (me.username || me.first_name || 'bot')) : 'No se pudo validar el token (red/CORS). Se intentará enviar igual.';
+        }
+        return sendTelegram('SMC Oscar · TEST · ' + (state.pair || '') + ' · ' + new Date().toLocaleString(), { force: true });
+      }).then(function (res) {
+        if (!res) res = { ok: false, error: 'Sin respuesta' };
+        if (st) st.textContent = res.ok
+          ? ('Enviado' + (res.via === 'popup' ? ' (revisa la pestaña abierta)' : '') + '. Mira Telegram.')
+          : ('Error: ' + (res.error || 'desconocido'));
+        alert(res.ok
+          ? ('Mensaje de prueba enviado.\nRevisa el chat con tu bot en Telegram.' + (res.note ? '\n\n' + res.note : ''))
+          : ('No se pudo enviar.\n\n' + (res.error || '') + '\n\nChecklist:\n• Token de @BotFather\n• Chat ID numérico de @userinfobot\n• Abriste el bot y pulsaste Start\n• Usa el link de GitHub Pages (HTTPS)'));
       });
+    };
+    var btnTgOpen = document.getElementById('btnTgOpen');
+    if (btnTgOpen) btnTgOpen.onclick = function () {
+      state.telegram.token = (tgTok && tgTok.value || '').trim().replace(/\s+/g, '');
+      state.telegram.chatId = (tgChat && tgChat.value || '').trim().replace(/\s+/g, '');
+      saveTelegramPrefs();
+      var token = state.telegram.token, chat = state.telegram.chatId;
+      if (!token || !chat) { alert('Completa token y chat ID'); return; }
+      var msg = encodeURIComponent('SMC Oscar · TEST manual · ' + new Date().toLocaleString());
+      var url = 'https://api.telegram.org/bot' + token + '/sendMessage?chat_id=' + encodeURIComponent(chat) + '&text=' + msg;
+      window.open(url, '_blank', 'noopener,noreferrer');
     };
     if (btnCsv) btnCsv.onclick = function () {
       var rows = [['pair','dir','entry','sl','tp','result','pnl','setup','date']];
@@ -4640,80 +4845,118 @@
     } catch (e) {}
   }
 
-  function sendTelegram(text) {
-    // Desde file:// y muchos navegadores, api.telegram.org bloquea lectura CORS.
-    // Estrategia: 1) proxies CORS  2) GET no-cors + Image (el request SÍ llega a Telegram)
-    if (!state.telegram || !state.telegram.enabled) return Promise.resolve(false);
-    var token = (state.telegram.token || '').trim().replace(/\s+/g, '');
+  function sendTelegram(text, opts) {
+    opts = opts || {};
+    var force = !!opts.force; // prueba: ignora enabled
+    if (!state.telegram) state.telegram = { token: '', chatId: '', enabled: false };
+    if (!force && !state.telegram.enabled) return Promise.resolve({ ok: false, error: 'Telegram OFF' });
+
+    var token = String(state.telegram.token || '').trim().replace(/\s+/g, '');
     var chat = String(state.telegram.chatId || '').trim().replace(/\s+/g, '');
-    if (!token || !chat) return Promise.resolve(false);
+    if (!token || token.indexOf(':') < 0) return Promise.resolve({ ok: false, error: 'Token inválido (debe ser 123456:AA...)' });
+    if (!chat || !/^-?\d+$/.test(chat)) return Promise.resolve({ ok: false, error: 'Chat ID inválido (solo números, ej: 123456789)' });
+
     var plain = String(text || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!plain) plain = 'SMC Oscar · test';
     if (plain.length > 3500) plain = plain.slice(0, 3500) + '...';
-    var api = 'https://api.telegram.org/bot' + token + '/sendMessage'
+
+    var apiSend = 'https://api.telegram.org/bot' + token + '/sendMessage'
       + '?chat_id=' + encodeURIComponent(chat)
       + '&text=' + encodeURIComponent(plain)
       + '&disable_web_page_preview=true';
 
-    function fireNoCors() {
-      // Dispara el GET sin leer respuesta (funciona en file:// y HTTPS)
+    function parseTg(txt) {
+      if (!txt) return null;
       try {
-        fetch(api, { method: 'GET', mode: 'no-cors', cache: 'no-store' }).catch(function () {});
-      } catch (e1) {}
-      try {
-        var img = new Image();
-        img.src = api + '&_=' + Date.now();
-      } catch (e2) {}
-      try {
-        var iframe = document.createElement('iframe');
-        iframe.style.cssText = 'display:none;width:0;height:0;border:0';
-        iframe.src = api;
-        document.body.appendChild(iframe);
-        setTimeout(function () { try { document.body.removeChild(iframe); } catch (e) {} }, 4000);
-      } catch (e3) {}
+        // allorigins envuelve en { contents: "..." }
+        var j = JSON.parse(txt);
+        if (j && typeof j.contents === 'string') {
+          try { j = JSON.parse(j.contents); } catch (e) { return null; }
+        }
+        return j;
+      } catch (e) {
+        if (txt.indexOf('"ok":true') >= 0) return { ok: true };
+        if (txt.indexOf('"ok":false') >= 0) return { ok: false, description: txt.slice(0, 200) };
+        return null;
+      }
     }
 
-    var proxies = [
-      'https://corsproxy.io/?' + encodeURIComponent(api),
-      'https://api.allorigins.win/raw?url=' + encodeURIComponent(api),
-      'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(api)
-    ];
-
-    return new Promise(function (resolve) {
-      var done = false;
-      function ok(v) {
-        if (done) return;
-        done = true;
-        resolve(!!v);
-      }
-      // Siempre disparar no-cors (entrega real del mensaje)
-      fireNoCors();
-      // Intentar confirmar por proxy
-      var left = proxies.length;
-      if (!left) {
-        setTimeout(function () { ok(true); }, 800);
-        return;
-      }
-      proxies.forEach(function (u) {
-        fetch(u, { method: 'GET', mode: 'cors', cache: 'no-store' })
+    function viaProxy(url) {
+      var proxies = [
+        'https://corsproxy.io/?' + encodeURIComponent(url),
+        'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+        'https://api.allorigins.win/get?url=' + encodeURIComponent(url),
+        'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url)
+      ];
+      function next(i) {
+        if (i >= proxies.length) return Promise.resolve(null);
+        return fetch(proxies[i], { method: 'GET', mode: 'cors', cache: 'no-store' })
           .then(function (r) { return r.text(); })
           .then(function (txt) {
-            if (txt && txt.indexOf('"ok":true') >= 0) ok(true);
-            else if (txt && txt.indexOf('"ok":false') >= 0) {
-              try { console.warn('Telegram:', JSON.parse(txt).description); } catch (e) {}
-            }
+            var j = parseTg(txt);
+            if (j && j.ok === true) return j;
+            if (j && j.ok === false) return j; // error real de Telegram (no reintentar)
+            return next(i + 1);
           })
-          .catch(function () {})
-          .then(function () {
-            left--;
-            if (left <= 0 && !done) {
-              // Sin confirmación CORS: asumimos envío por no-cors/iframe
-              ok(true);
-            }
-          });
-      });
-      // Tope de espera
-      setTimeout(function () { if (!done) ok(true); }, 5000);
+          .catch(function () { return next(i + 1); });
+      }
+      return next(0);
+    }
+
+    // Disparo no-cors (ayuda en algunos navegadores)
+    try { fetch(apiSend, { method: 'GET', mode: 'no-cors', cache: 'no-store' }).catch(function () {}); } catch (e0) {}
+    try {
+      var img = new Image();
+      img.src = apiSend + '&_ts=' + Date.now();
+    } catch (e1) {}
+
+    return viaProxy(apiSend).then(function (j) {
+      if (j && j.ok === true) return { ok: true };
+      if (j && j.ok === false) {
+        var desc = j.description || 'Error API Telegram';
+        // Errores típicos
+        if (/chat not found/i.test(desc)) desc = 'Chat no encontrado: abre @SmcOscarbot, pulsa Start y usa el Chat ID de @userinfobot';
+        if (/bot was blocked/i.test(desc)) desc = 'Bloqueaste el bot: desbloquéalo y pulsa Start';
+        if (/unauthorized/i.test(desc)) desc = 'Token inválido o revocado. Genera uno nuevo en @BotFather';
+        return { ok: false, error: desc };
+      }
+      // Sin confirmación por CORS: en modo prueba abrimos ventana para forzar envío visible
+      if (force) {
+        try {
+          var w = window.open(apiSend, '_blank', 'noopener,noreferrer,width=520,height=320');
+          if (w) return { ok: true, via: 'popup', note: 'Se abrió una pestaña con la respuesta de Telegram. Si dice ok:true, el mensaje llegó.' };
+        } catch (e2) {}
+        return { ok: false, error: 'No se pudo confirmar el envío (CORS). Prueba el botón "Enviar en pestaña" o usa HTTPS.' };
+      }
+      // Alertas automáticas: asumimos intento enviado
+      return { ok: true, via: 'no-cors' };
     });
+  }
+
+  function telegramGetMe() {
+    var token = String((state.telegram && state.telegram.token) || '').trim().replace(/\s+/g, '');
+    if (!token || token.indexOf(':') < 0) return Promise.resolve(null);
+    var url = 'https://api.telegram.org/bot' + token + '/getMe';
+    var proxies = [
+      'https://corsproxy.io/?' + encodeURIComponent(url),
+      'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+      'https://api.allorigins.win/get?url=' + encodeURIComponent(url)
+    ];
+    function next(i) {
+      if (i >= proxies.length) return Promise.resolve(null);
+      return fetch(proxies[i], { method: 'GET', mode: 'cors', cache: 'no-store' })
+        .then(function (r) { return r.text(); })
+        .then(function (txt) {
+          try {
+            var j = JSON.parse(txt);
+            if (j && j.contents) j = JSON.parse(j.contents);
+            if (j && j.ok && j.result) return j.result;
+          } catch (e) {}
+          return next(i + 1);
+        })
+        .catch(function () { return next(i + 1); });
+    }
+    return next(0);
   }
 
   function journalStats(trades) {
@@ -4830,7 +5073,7 @@
     if (state.telegram && state.telegram.enabled) {
       var tgMsg = title + ' | ' + body + ' | Bias: ' + (state.bias || '-') +
         (state.mtf && state.mtf.ready ? ' | MTF OK' : ' | MTF pending');
-      sendTelegram(tgMsg);
+      sendTelegram(tgMsg).catch(function(){});
     }
     state.alerts.lastSent[key] = now;
     state.alerts.lastSent[state.pair] = now;
