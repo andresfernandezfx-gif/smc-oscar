@@ -147,9 +147,32 @@
     .status-dot.live { background: var(--green); box-shadow: 0 0 6px var(--green); }
     .status-dot.stale { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; animation: pulse-stale 1s infinite; }
     @keyframes pulse-stale { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
-  </style>
+  
+#pinLock{position:fixed;inset:0;z-index:99999;background:#0b0f14;display:flex;align-items:center;justify-content:center;padding:20px}
+#pinLock.hidden{display:none!important}
+.pin-box{background:#121820;border:1px solid #1e2a36;border-radius:14px;padding:24px 20px;max-width:340px;width:100%;text-align:center}
+.pin-box h2{margin:0 0 6px;font-size:18px;color:#e8eef4}
+.pin-box p{margin:0 0 14px;font-size:12px;color:#8b9bb0;line-height:1.4}
+.pin-box input{width:100%;padding:12px;border-radius:8px;border:1px solid #2a3a4a;background:#0b0f14;color:#e8eef4;font-size:18px;letter-spacing:4px;text-align:center;margin-bottom:10px}
+.pin-box button{width:100%;padding:12px;border:0;border-radius:8px;background:#3b82f6;color:#fff;font-weight:700;cursor:pointer;margin-top:4px}
+.pin-box button.secondary{background:transparent;border:1px solid #2a3a4a;color:#8b9bb0;margin-top:8px}
+.pin-err{color:#f87171;font-size:12px;min-height:16px;margin-top:8px}
+
+</style>
 </head>
 <body>
+
+<div id="pinLock">
+  <div class="pin-box">
+    <h2>SMC - Oscar FX</h2>
+    <p id="pinHint">Introduce tu PIN de acceso</p>
+    <input id="pinInput" type="password" inputmode="numeric" maxlength="8" placeholder="••••" autocomplete="off">
+    <button type="button" id="pinSubmit">Entrar</button>
+    <button type="button" class="secondary" id="pinSetup" style="display:none">Cambiar PIN</button>
+    <div class="pin-err" id="pinErr"></div>
+  </div>
+</div>
+
 <div class="app">
   <header class="header">
     <div class="logo">SMC - Oscar FX</div>
@@ -533,7 +556,77 @@
     });
   }
 
+
+  function oandaGranularity(tf) {
+    if (tf === '5m') return 'M5';
+    if (tf === '15m') return 'M15';
+    if (tf === '1h') return 'H1';
+    if (tf === '4h') return 'H4';
+    return 'D';
+  }
+  function oandaInstrument(pair) {
+    pair = (pair || 'EURUSD').replace('/', '');
+    if (pair === 'XAUUSD') return 'XAU_USD';
+    if (pair.length === 6) return pair.slice(0, 3) + '_' + pair.slice(3);
+    return pair;
+  }
+  function getOandaToken() {
+    try { return localStorage.getItem('smc-oanda-token') || ''; } catch (e) { return ''; }
+  }
+  function getOandaEnv() {
+    try { return localStorage.getItem('smc-oanda-env') || 'practice'; } catch (e) { return 'practice'; }
+  }
+  function fetchOandaCandles(pair, tf, count) {
+    return new Promise(function (resolve) {
+      var token = getOandaToken();
+      if (!token) { resolve(null); return; }
+      var host = getOandaEnv() === 'live' ? 'https://api-fxtrade.oanda.com' : 'https://api-fxpractice.oanda.com';
+      var inst = oandaInstrument(pair);
+      var gran = oandaGranularity(tf);
+      count = count || 150;
+      var url = host + '/v3/instruments/' + encodeURIComponent(inst) +
+        '/candles?granularity=' + gran + '&count=' + count + '&price=M';
+      var attempts = [
+        { u: url, direct: true },
+        { u: 'https://corsproxy.io/?' + encodeURIComponent(url), direct: false },
+        { u: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url), direct: false },
+        { u: 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url), direct: false }
+      ];
+      function next(i) {
+        if (i >= attempts.length) { resolve(null); return; }
+        var a = attempts[i];
+        var opts = { mode: 'cors', headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' } };
+        fetch(a.u, opts).then(function (r) { return r.ok ? r.json() : Promise.reject(); }).then(function (j) {
+          if (typeof j === 'string') { try { j = JSON.parse(j); } catch (e) { next(i + 1); return; } }
+          if (!j || !j.candles || !j.candles.length) { next(i + 1); return; }
+          var out = [];
+          j.candles.forEach(function (c) {
+            var mid = c.mid || c.bid || c.ask;
+            if (!mid) return;
+            out.push({
+              time: Math.floor(new Date(c.time).getTime() / 1000),
+              open: +mid.o, high: +mid.h, low: +mid.l, close: +mid.c
+            });
+          });
+          if (out.length > 10) {
+            state.liveSource = 'OANDA ' + (getOandaEnv() === 'live' ? 'Live' : 'Practice');
+            resolve(out);
+          } else next(i + 1);
+        }).catch(function () { next(i + 1); });
+      }
+      next(0);
+    });
+  }
+
   function fetchLiveCandles(pair, tf, maxBarsOverride) {
+    return new Promise(function (resolve) {
+      fetchOandaCandles(pair, tf, maxBarsOverride || 150).then(function (od) {
+        if (od && od.length > 10) { resolve(od); return; }
+        fetchLiveCandlesLegacy(pair, tf, maxBarsOverride).then(resolve);
+      });
+    });
+  }
+  function fetchLiveCandlesLegacy(pair, tf, maxBarsOverride) {
     return new Promise(function (resolve) {
       var ySym = yahooSymbols[pair] || (pair + '=X');
       var ir = yahooInterval(tf);
@@ -4053,6 +4146,10 @@
     }
 
     html += '<div class="card"><div class="card-header">Datos LIVE (forex)</div>';
+    html += '<p style="font-size:12px;color:var(--muted);margin-bottom:8px">Token OANDA Practice (Manage API Access). Prioridad sobre Yahoo.</p>';
+    html += '<input id="inpOandaToken" type="password" placeholder="OANDA API token" value="' + escapeHtml((typeof getOandaToken==='function'?getOandaToken():'')) + '" style="margin-bottom:6px">';
+    html += '<select id="selOandaEnv" style="margin-bottom:8px"><option value="practice">Practice (demo)</option><option value="live">Live</option></select>';
+    html += '<button type="button" class="btn btn-outline" id="btnSaveOanda" style="margin-bottom:12px">Guardar OANDA y recargar</button>';
     html += '<p style="font-size:12px;color:var(--muted);margin-bottom:8px">Fuente prioritaria: Yahoo FX / Stooq. Opcional: token gratis <strong>Finnhub</strong> (feed tipo OANDA, más cercano a TV).</p>';
     html += '<input type="text" id="inpFhToken" placeholder="Token Finnhub (opcional)" value="" style="margin-bottom:8px">';
     html += '<button type="button" class="btn btn-outline" id="btnSaveFh" style="margin-bottom:10px">Guardar token y recargar LIVE</button>';
@@ -4167,7 +4264,90 @@
     if (btnFh) btnFh.onclick = function () {
       var v = (document.getElementById('inpFhToken').value || '').trim();
       try { if (v) localStorage.setItem('smc-fh-token', v); else localStorage.removeItem('smc-fh-token'); } catch (e) {}
-      refreshData();
+    
+  (function initPinLock() {
+    var KEY = 'smc-oscar-pin-hash';
+    var UNLOCK = 'smc-oscar-unlocked';
+    function hash(s) {
+      var h = 5381;
+      s = 'smc|' + String(s) + '|oscar';
+      for (var i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i);
+      return (h >>> 0).toString(16);
+    }
+    function hasPin() { try { return !!localStorage.getItem(KEY); } catch (e) { return false; } }
+    function setPin(pin) { try { localStorage.setItem(KEY, hash(pin)); } catch (e) {} }
+    function checkPin(pin) { try { return localStorage.getItem(KEY) === hash(pin); } catch (e) { return false; } }
+    function unlockSession() {
+      try { sessionStorage.setItem(UNLOCK, '1'); } catch (e) {}
+      var el = document.getElementById('pinLock');
+      if (el) el.classList.add('hidden');
+    }
+    function isUnlocked() { try { return sessionStorage.getItem(UNLOCK) === '1'; } catch (e) { return false; } }
+    var lock = document.getElementById('pinLock');
+    if (!lock) return;
+    if (isUnlocked()) { lock.classList.add('hidden'); return; }
+    var hint = document.getElementById('pinHint');
+    var inp = document.getElementById('pinInput');
+    var err = document.getElementById('pinErr');
+    var btn = document.getElementById('pinSubmit');
+    var setup = document.getElementById('pinSetup');
+    var mode = hasPin() ? 'login' : 'create';
+    function refreshUI() {
+      if (mode === 'create') {
+        hint.textContent = 'Crea un PIN (4-8 digitos). Solo se guarda en este dispositivo.';
+        btn.textContent = 'Guardar PIN';
+        if (setup) setup.style.display = 'none';
+      } else if (mode === 'reset') {
+        hint.textContent = 'Escribe: PIN_ACTUAL NUEVO_PIN';
+        btn.textContent = 'Cambiar PIN';
+        if (setup) setup.style.display = 'none';
+      } else {
+        hint.textContent = 'Introduce tu PIN de acceso';
+        btn.textContent = 'Entrar';
+        if (setup) setup.style.display = 'block';
+      }
+      if (err) err.textContent = '';
+      if (inp) { inp.value = ''; inp.focus(); }
+    }
+    if (setup) setup.onclick = function () { mode = 'reset'; refreshUI(); };
+    function submit() {
+      var v = (inp && inp.value || '').trim();
+      if (mode === 'create') {
+        if (!/^\d{4,8}$/.test(v)) { err.textContent = 'Usa 4 a 8 digitos'; return; }
+        setPin(v); unlockSession(); return;
+      }
+      if (mode === 'reset') {
+        var parts = v.split(/\s+/);
+        if (parts.length < 2) { err.textContent = 'Formato: PIN_ACTUAL NUEVO'; return; }
+        if (!checkPin(parts[0])) { err.textContent = 'PIN actual incorrecto'; return; }
+        if (!/^\d{4,8}$/.test(parts[1])) { err.textContent = 'Nuevo PIN: 4-8 digitos'; return; }
+        setPin(parts[1]); unlockSession(); return;
+      }
+      if (!checkPin(v)) { err.textContent = 'PIN incorrecto'; if (inp) inp.value = ''; return; }
+      unlockSession();
+    }
+    if (btn) btn.onclick = submit;
+    if (inp) inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') submit(); });
+    refreshUI();
+  })();
+
+
+  setTimeout(function () {
+    document.addEventListener('click', function (ev) {
+      if (!ev.target || ev.target.id !== 'btnSaveOanda') return;
+      var tokEl = document.getElementById('inpOandaToken');
+      var envEl = document.getElementById('selOandaEnv');
+      var tok = (tokEl && tokEl.value || '').trim();
+      var env = (envEl && envEl.value) || 'practice';
+      try {
+        if (tok) localStorage.setItem('smc-oanda-token', tok); else localStorage.removeItem('smc-oanda-token');
+        localStorage.setItem('smc-oanda-env', env);
+      } catch (e) {}
+      alert(tok ? 'Token OANDA guardado. Recargando…' : 'Token eliminado');
+      if (typeof refreshData === 'function') refreshData();
+    });
+  }, 0);
+  refreshData();
       alert(v ? 'Token guardado. Recargando LIVE…' : 'Token eliminado');
     };
     var btnRefresh = document.getElementById('btnForceRefresh');
