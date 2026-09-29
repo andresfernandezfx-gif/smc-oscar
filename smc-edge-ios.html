@@ -6,7 +6,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <meta name="theme-color" content="#0a0e17" />
-  <title>SMC - Oscar FX</title>
+  <title>SMC - Oscar FX & Crypto</title>
   <link rel="manifest" href="manifest.json">
   <meta name="theme-color" content="#0a0e18">
   <link rel="apple-touch-icon" href="icon-180.png">
@@ -164,7 +164,7 @@
 
 <div id="pinLock">
   <div class="pin-box">
-    <h2>SMC - Oscar FX</h2>
+    <h2>SMC - Oscar</h2>
     <p id="pinHint">Introduce tu PIN de acceso</p>
     <input id="pinInput" type="password" inputmode="numeric" maxlength="8" placeholder="••••" autocomplete="off">
     <button type="button" id="pinSubmit">Entrar</button>
@@ -175,20 +175,38 @@
 
 <div class="app">
   <header class="header">
-    <div class="logo">SMC - Oscar FX</div>
+    <div class="logo">SMC - Oscar</div>
     <span id="fxSessionBadge" style="font-size:10px;font-weight:600;color:var(--muted);white-space:nowrap"></span>
+    <select class="pair-select" id="marketSelect" style="max-width:72px">
+      <option value="FX">FX</option>
+      <option value="CRYPTO">Crypto</option>
+    </select>
     <select class="pair-select" id="pairSelect">
-      <option value="EURUSD">EURUSD</option>
-      <option value="GBPUSD">GBPUSD</option>
-      <option value="USDJPY">USDJPY</option>
-      <option value="AUDUSD">AUDUSD</option>
-      <option value="USDCAD">USDCAD</option>
-      <option value="USDCHF">USDCHF</option>
-      <option value="NZDUSD">NZDUSD</option>
-      <option value="EURGBP">EURGBP</option>
-      <option value="EURJPY">EURJPY</option>
-      <option value="GBPJPY">GBPJPY</option>
-      <option value="XAUUSD">XAUUSD</option>
+      <optgroup label="Forex" id="optFx">
+        <option value="EURUSD">EURUSD</option>
+        <option value="GBPUSD">GBPUSD</option>
+        <option value="USDJPY">USDJPY</option>
+        <option value="AUDUSD">AUDUSD</option>
+        <option value="USDCAD">USDCAD</option>
+        <option value="USDCHF">USDCHF</option>
+        <option value="NZDUSD">NZDUSD</option>
+        <option value="EURGBP">EURGBP</option>
+        <option value="EURJPY">EURJPY</option>
+        <option value="GBPJPY">GBPJPY</option>
+        <option value="XAUUSD">XAUUSD</option>
+      </optgroup>
+      <optgroup label="Crypto USDT" id="optCrypto">
+        <option value="BTCUSDT">BTCUSDT</option>
+        <option value="ETHUSDT">ETHUSDT</option>
+        <option value="SOLUSDT">SOLUSDT</option>
+        <option value="XRPUSDT">XRPUSDT</option>
+        <option value="BNBUSDT">BNBUSDT</option>
+        <option value="ADAUSDT">ADAUSDT</option>
+        <option value="DOGEUSDT">DOGEUSDT</option>
+        <option value="AVAXUSDT">AVAXUSDT</option>
+        <option value="LINKUSDT">LINKUSDT</option>
+        <option value="DOTUSDT">DOTUSDT</option>
+      </optgroup>
     </select>
     <div class="tf-group" id="tfGroup">
       <button type="button" class="tf-btn" data-tf="1h">1h</button>
@@ -303,7 +321,7 @@
   var basePrices = {
     EURUSD: 1.13921, GBPUSD: 1.32436, USDJPY: 158.28, AUDUSD: 0.70423,
     USDCAD: 1.4099, USDCHF: 0.82469, NZDUSD: 0.56773, EURGBP: 0.85974,
-    EURJPY: 180.22, GBPJPY: 209.6, XAUUSD: 4322.7
+    EURJPY: 180.22, GBPJPY: 209.6, XAUUSD: 4322.7, BTCUSDT: 95000, ETHUSDT: 3500, SOLUSDT: 180, XRPUSDT: 0.55, BNBUSDT: 600, ADAUSDT: 0.45, DOGEUSDT: 0.12, AVAXUSDT: 25, LINKUSDT: 15, DOTUSDT: 5
   };
   var vols = {
     EURUSD: 0.0009, GBPUSD: 0.0012, USDJPY: 0.18, AUDUSD: 0.0009,
@@ -317,8 +335,8 @@
   var yahooSymbols = {
     EURUSD: 'EURUSD=X', GBPUSD: 'GBPUSD=X', USDJPY: 'USDJPY=X', AUDUSD: 'AUDUSD=X',
     USDCAD: 'USDCAD=X', USDCHF: 'USDCHF=X', NZDUSD: 'NZDUSD=X', EURGBP: 'EURGBP=X',
-    EURJPY: 'EURJPY=X', GBPJPY: 'GBPJPY=X', XAUUSD: 'GC=F'
-  };
+    EURJPY: 'EURJPY=X', GBPJPY: 'GBPJPY=X', XAUUSD: 'GC=F',
+    BTCUSDT: 'BTC-USD', ETHUSDT: 'ETH-USD', SOLUSDT: 'SOL-USD', XRPUSDT: 'XRP-USD', BNBUSDT: 'BNB-USD', ADAUSDT: 'ADA-USD', DOGEUSDT: 'DOGE-USD', AVAXUSDT: 'AVAX-USD', LINKUSDT: 'LINK-USD', DOTUSDT: 'DOT-USD',};
 
 
   var state = {
@@ -388,6 +406,10 @@
   }
 
   function parseYahooChart(json, tf, maxBarsOverride) {
+    if (json && typeof json.contents === 'string') {
+      try { json = JSON.parse(json.contents); } catch (e) { return null; }
+    }
+
     try {
       var res = json.chart && json.chart.result && json.chart.result[0];
       if (!res || !res.timestamp) return null;
@@ -491,6 +513,18 @@
   }
 
   function fetchSpotPrice(pair) {
+    return new Promise(function (resolve) {
+      if (isCryptoPair(pair)) {
+        fetchBinanceSpot(pair).then(function (px) {
+          if (px > 0) { resolve(px); return; }
+          fetchSpotPriceFx(pair).then(resolve);
+        });
+        return;
+      }
+      fetchSpotPriceFx(pair).then(resolve);
+    });
+  }
+  function fetchSpotPriceFx(pair) {
     return new Promise(function (resolve) {
       var settled = false;
       function win(px) {
@@ -618,8 +652,109 @@
     });
   }
 
+
+  function isCryptoPair(pair) {
+    pair = (pair || state.pair || '').toUpperCase();
+    return pair.indexOf('USDT') >= 0 || pair.indexOf('BTC') === 0 && pair.length > 3;
+  }
+  function binanceInterval(tf) {
+    if (tf === '5m') return '5m';
+    if (tf === '15m') return '15m';
+    if (tf === '1h') return '1h';
+    if (tf === '4h') return '4h';
+    if (tf === '1D' || tf === '1d') return '1d';
+    return '15m';
+  }
+  function fetchBinanceKlines(pair, tf, limit) {
+    return new Promise(function (resolve) {
+      pair = (pair || '').toUpperCase().replace('/', '');
+      if (pair.indexOf('USDT') < 0) { resolve(null); return; }
+      limit = limit || 150;
+      var iv = binanceInterval(tf);
+      var url = 'https://api.binance.com/api/v3/klines?symbol=' + encodeURIComponent(pair) +
+        '&interval=' + iv + '&limit=' + limit;
+      var attempts = [
+        url,
+        'https://data-api.binance.vision/api/v3/klines?symbol=' + encodeURIComponent(pair) + '&interval=' + iv + '&limit=' + limit,
+        'https://corsproxy.io/?' + encodeURIComponent(url),
+        'https://api.allorigins.win/raw?url=' + encodeURIComponent(url)
+      ];
+      function next(i) {
+        if (i >= attempts.length) { resolve(null); return; }
+        fetch(attempts[i], { mode: 'cors', cache: 'no-store' }).then(function (r) {
+          return r.ok ? r.json() : Promise.reject();
+        }).then(function (j) {
+          if (typeof j === 'string') { try { j = JSON.parse(j); } catch (e) { next(i + 1); return; } }
+          if (!Array.isArray(j) || j.length < 10) { next(i + 1); return; }
+          var out = j.map(function (k) {
+            return {
+              time: Math.floor(k[0] / 1000),
+              open: +k[1], high: +k[2], low: +k[3], close: +k[4]
+            };
+          });
+          state.liveSource = 'Binance';
+          resolve(out);
+        }).catch(function () { next(i + 1); });
+      }
+      next(0);
+    });
+  }
+  function fetchBinanceSpot(pair) {
+    return new Promise(function (resolve) {
+      pair = (pair || '').toUpperCase().replace('/', '');
+      if (pair.indexOf('USDT') < 0) { resolve(null); return; }
+      var url = 'https://api.binance.com/api/v3/ticker/price?symbol=' + encodeURIComponent(pair);
+      fetch(url, { mode: 'cors', cache: 'no-store' }).then(function (r) { return r.json(); })
+        .then(function (j) { resolve(j && j.price ? +j.price : null); })
+        .catch(function () {
+          fetch('https://corsproxy.io/?' + encodeURIComponent(url)).then(function (r) { return r.json(); })
+            .then(function (j) { resolve(j && j.price ? +j.price : null); })
+            .catch(function () { resolve(null); });
+        });
+    });
+  }
+  function startCryptoWS() {
+    try { if (state.ws && state.ws.sock) state.ws.sock.close(); } catch (e) {}
+    if (!isCryptoPair(state.pair)) return;
+    try {
+      var sym = state.pair.toLowerCase();
+      var sock = new WebSocket('wss://stream.binance.com:9443/ws/' + sym + '@trade');
+      state.ws = { sock: sock, connected: false };
+      sock.onopen = function () { state.ws.connected = true; };
+      sock.onmessage = function (ev) {
+        try {
+          var msg = JSON.parse(ev.data);
+          var px = msg && msg.p ? +msg.p : null;
+          if (px > 0) {
+            applySpotToLastCandle(px);
+            state.lastUpdateTs = Date.now();
+            state.liveSource = 'Binance WS';
+            state.dataSource = 'live';
+            setDataSourceUI();
+            if (!state._wsDrawBusy) {
+              state._wsDrawBusy = true;
+              requestAnimationFrame(function () { applyAnalysis(); state._wsDrawBusy = false; });
+            }
+          }
+        } catch (e2) {}
+      };
+      sock.onclose = function () {
+        state.ws.connected = false;
+        if (state.live && isCryptoPair(state.pair)) setTimeout(startCryptoWS, 5000);
+      };
+    } catch (e) {}
+  }
+
   function fetchLiveCandles(pair, tf, maxBarsOverride) {
     return new Promise(function (resolve) {
+      if (isCryptoPair(pair)) {
+        fetchBinanceKlines(pair, tf, maxBarsOverride || 150).then(function (bn) {
+          if (bn && bn.length > 10) { resolve(bn); return; }
+          // fallback Yahoo crypto USD
+          fetchLiveCandlesLegacy(pair, tf, maxBarsOverride).then(resolve);
+        });
+        return;
+      }
       fetchOandaCandles(pair, tf, maxBarsOverride || 150).then(function (od) {
         if (od && od.length > 10) { resolve(od); return; }
         fetchLiveCandlesLegacy(pair, tf, maxBarsOverride).then(resolve);
@@ -661,11 +796,12 @@
         attempts.push({ type: 'finnhub', url: 'https://corsproxy.io/?' + encodeURIComponent(fhPath) });
       }
       attempts = attempts.concat([
-        // Proxies primero: en iPhone/Safari el fetch directo a Yahoo suele fallar por CORS
         { type: 'yahoo', url: 'https://corsproxy.io/?' + encodeURIComponent(yPath) },
         { type: 'yahoo', url: 'https://api.allorigins.win/raw?url=' + encodeURIComponent(yPath) },
+        { type: 'yahoo', url: 'https://api.allorigins.win/get?url=' + encodeURIComponent(yPath) },
         { type: 'yahoo', url: 'https://corsproxy.io/?' + encodeURIComponent(yPath2) },
         { type: 'yahoo', url: 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(yPath) },
+        { type: 'yahoo', url: 'https://thingproxy.freeboard.io/fetch/' + yPath },
         { type: 'yahoo', url: yPath },
         { type: 'yahoo', url: yPath2 },
         { type: 'stooq', url: 'https://corsproxy.io/?' + encodeURIComponent(stooqPath) },
@@ -689,7 +825,7 @@
       // Timeout global de red
       setTimeout(function () {
         if (!settled) { settled = true; resolve(null); }
-      }, maxBarsOverride ? 8000 : 6000);
+      }, maxBarsOverride ? 12000 : 10000);
 
       attempts.forEach(function (a) {
         if (a.type === 'stooq') {
@@ -3146,7 +3282,7 @@
         AUDUSD: 'OANDA:AUDUSD', USDCAD: 'OANDA:USDCAD', USDCHF: 'OANDA:USDCHF',
         NZDUSD: 'OANDA:NZDUSD', EURGBP: 'OANDA:EURGBP', EURJPY: 'OANDA:EURJPY',
         GBPJPY: 'OANDA:GBPJPY', XAUUSD: 'OANDA:XAUUSD'
-      },
+      , BTCUSDT: 'BINANCE:BTCUSDT', ETHUSDT: 'BINANCE:ETHUSDT', SOLUSDT: 'BINANCE:SOLUSDT', XRPUSDT: 'BINANCE:XRPUSDT', BNBUSDT: 'BINANCE:BNBUSDT', ADAUSDT: 'BINANCE:ADAUSDT', DOGEUSDT: 'BINANCE:DOGEUSDT', AVAXUSDT: 'BINANCE:AVAXUSDT', LINKUSDT: 'BINANCE:LINKUSDT', DOTUSDT: 'BINANCE:DOTUSDT'},
       FXCM: {
         EURUSD: 'FXCM:EURUSD', GBPUSD: 'FXCM:GBPUSD', USDJPY: 'FXCM:USDJPY',
         AUDUSD: 'FXCM:AUDUSD', USDCAD: 'FXCM:USDCAD', USDCHF: 'FXCM:USDCHF',
@@ -3527,21 +3663,12 @@
     updateTvLink();
     if (showLoading) {
       var src = document.getElementById('dataSource');
-      if (src) src.textContent = 'Cargando ' + state.pair + ' ' + state.tf + '…';
+      if (src) src.textContent = 'Cargando mercado…';
+      var dot = document.getElementById('statusDot');
+      if (dot) { dot.className = 'status-dot'; }
     }
-    // 1) Semilla real (Yahoo) — siempre disponible, sincronizada con mercado
-    var seeded = getSeedCandles(state.pair, state.tf);
-    if (seeded) {
-      state.candles = seeded;
-      state.dataSource = 'live';
-      state.lastUpdateTs = Date.now();
-      state.liveSource = 'FX Market';
-      basePrices[state.pair] = seeded[seeded.length - 1].close;
-      setDataSourceUI();
-      applyAnalysis();
-    }
-    // 2) Intentar refrescar en vivo (puede fallar por CORS en iPhone)
-    return fetchLiveCandles(state.pair, state.tf).then(function (data) {
+    // NO pintar semilla como "live": primero red, semilla solo de respaldo
+    return fetchLiveCandles(state.pair, state.tf, null).then(function (data) {
       if (data && data.length > 10) {
         state.candles = data;
         state.dataSource = 'live';
@@ -3550,44 +3677,122 @@
         basePrices[state.pair] = data[data.length - 1].close;
         setDataSourceUI();
         applyAnalysis();
+        // Refrescar spot encima de la última vela
+        fetchSpotPrice(state.pair).then(function (spot) {
+          if (spot && spot > 0) {
+            applySpotToLastCandle(spot);
+            state.lastUpdateTs = Date.now();
+            state.liveSource = (state.liveSource || 'Yahoo') + ' + RT';
+            setDataSourceUI();
+            applyAnalysis();
+          }
+        }).catch(function () {});
         return true;
       }
-      // 3) Spot encima de la semilla
+      // Fallback: spot real + estructura de semilla (precios anclados al spot actual)
       return fetchSpotPrice(state.pair).then(function (spot) {
-        if (spot && spot > 0) {
-          if (!state.candles || state.candles.length < 10) {
-            var s2 = getSeedCandles(state.pair, state.tf);
-            state.candles = s2 || generateCandles(state.pair, state.tf, 120);
-          }
-          applySpotToLastCandle(spot);
+        var seeded = getSeedCandles(state.pair, state.tf);
+        if (seeded && seeded.length > 10 && spot && spot > 0) {
+          state.candles = shiftSeedToSpot(seeded, spot);
           state.dataSource = 'live';
           state.lastUpdateTs = Date.now();
-          state.liveSource = 'FX Market RT';
+          state.liveSource = 'Spot RT + estructura';
+          basePrices[state.pair] = spot;
           setDataSourceUI();
           applyAnalysis();
           return true;
         }
-        if (!state.candles || !state.candles.length) {
-          state.candles = generateCandles(state.pair, state.tf, 120);
+        if (spot && spot > 0) {
+          state.candles = generateCandlesAroundSpot(state.pair, state.tf, spot, 120);
+          state.dataSource = 'live';
+          state.lastUpdateTs = Date.now();
+          state.liveSource = 'Spot RT';
+          basePrices[state.pair] = spot;
+          setDataSourceUI();
+          applyAnalysis();
+          return true;
+        }
+        if (seeded && seeded.length > 10) {
+          state.candles = seeded;
           state.dataSource = 'sim';
-          state.liveSource = 'Simulado';
+          state.liveSource = 'Semilla (sin red)';
+          state.lastUpdateTs = null;
+          basePrices[state.pair] = seeded[seeded.length - 1].close;
+          setDataSourceUI();
+          applyAnalysis();
+          return false;
+        }
+        state.candles = generateCandles(state.pair, state.tf, 120);
+        state.dataSource = 'sim';
+        state.liveSource = 'Simulado';
+        setDataSourceUI();
+        applyAnalysis();
+        return false;
+      });
+    }).catch(function () {
+      return fetchSpotPrice(state.pair).then(function (spot) {
+        var seeded = getSeedCandles(state.pair, state.tf);
+        if (seeded && spot && spot > 0) {
+          state.candles = shiftSeedToSpot(seeded, spot);
+          state.dataSource = 'live';
+          state.lastUpdateTs = Date.now();
+          state.liveSource = 'Spot RT + estructura';
+          basePrices[state.pair] = spot;
+          setDataSourceUI();
+          applyAnalysis();
+          return true;
+        }
+        if (seeded) {
+          state.candles = seeded;
+          state.dataSource = 'sim';
+          state.liveSource = 'Semilla (sin red)';
           setDataSourceUI();
           applyAnalysis();
         }
         return false;
-      });
-    }).catch(function () {
-      if (!state.candles || !state.candles.length) {
-        var s3 = getSeedCandles(state.pair, state.tf);
-        state.candles = s3 || generateCandles(state.pair, state.tf, 120);
-        state.dataSource = s3 ? 'live' : 'sim';
-        if (s3) state.lastUpdateTs = Date.now();
-        state.liveSource = s3 ? 'FX Market' : 'Simulado';
-        setDataSourceUI();
-        applyAnalysis();
-      }
-      return false;
+      }).catch(function () { return false; });
     });
+  }
+
+  /** Desplaza toda la serie seed para que el último close = spot actual (mantiene forma) */
+  function shiftSeedToSpot(candles, spot) {
+    if (!candles || !candles.length || !(spot > 0)) return candles;
+    var last = candles[candles.length - 1].close;
+    if (!(last > 0)) return candles;
+    var ratio = spot / last;
+    return candles.map(function (c) {
+      return {
+        time: c.time,
+        open: +(c.open * ratio),
+        high: +(c.high * ratio),
+        low: +(c.low * ratio),
+        close: +(c.close * ratio)
+      };
+    });
+  }
+
+  function generateCandlesAroundSpot(pair, tf, spot, count) {
+    count = count || 100;
+    var out = [];
+    var tfSec = tf === '5m' ? 300 : tf === '15m' ? 900 : tf === '1h' ? 3600 : tf === '4h' ? 14400 : 86400;
+    var t = Math.floor(Date.now() / 1000) - count * tfSec;
+    var px = spot * 0.998;
+    var vol = pair.indexOf('JPY') >= 0 || pair === 'XAUUSD' ? spot * 0.0008 : spot * 0.00035;
+    for (var i = 0; i < count; i++) {
+      var o = px;
+      var drift = (Math.random() - 0.48) * vol;
+      var c = o + drift;
+      var h = Math.max(o, c) + Math.random() * vol * 0.5;
+      var l = Math.min(o, c) - Math.random() * vol * 0.5;
+      out.push({ time: t + i * tfSec, open: o, high: h, low: l, close: c });
+      px = c;
+    }
+    // última vela anclada al spot
+    var last = out[out.length - 1];
+    last.close = spot;
+    last.high = Math.max(last.high, spot);
+    last.low = Math.min(last.low, spot);
+    return out;
   }
 
   function refreshData() {
@@ -4810,13 +5015,60 @@
     if (tab === 'chart') setTimeout(function () { drawChart(); try { updatePlanStrip(); } catch (e) {} }, 40);
   }
 
-  document.getElementById('pairSelect').onchange = function () { state.pair = this.value; stopForexWS(); refreshData(); setTimeout(startForexWS, 800); };
+  document.getElementById('pairSelect').onchange = function () { state.pair = this.value; stopForexWS(); try { if (state.ws && state.ws.sock) state.ws.sock.close(); } catch (e) {} refreshData(); setTimeout(function () { if (isCryptoPair(state.pair)) startCryptoWS(); else startForexWS(); }, 800); };
   document.getElementById('tfGroup').addEventListener('click', function (e) {
     var btn = e.target.closest('.tf-btn');
     if (!btn || !btn.dataset.tf) return;
     state.tf = btn.dataset.tf;
     document.querySelectorAll('.tf-btn').forEach(function (b) { b.classList.toggle('active', b.dataset.tf === state.tf); });
-    refreshData();
+  
+  function applyMarketFilter() {
+    var msel = document.getElementById('marketSelect');
+    var psel = document.getElementById('pairSelect');
+    if (!psel) return;
+    var mode = (msel && msel.value) || (isCryptoPair(state.pair) ? 'CRYPTO' : 'FX');
+    try { localStorage.setItem('smc-market-mode', mode); } catch (e) {}
+    var i, opt, isC;
+    for (i = 0; i < psel.options.length; i++) {
+      opt = psel.options[i];
+      if (!opt.value) continue;
+      isC = opt.value.indexOf('USDT') >= 0;
+      opt.hidden = (mode === 'FX' && isC) || (mode === 'CRYPTO' && !isC);
+      opt.disabled = opt.hidden;
+    }
+    // if current pair hidden, switch to first visible
+    var cur = psel.options[psel.selectedIndex];
+    if (cur && cur.hidden) {
+      for (i = 0; i < psel.options.length; i++) {
+        if (psel.options[i].value && !psel.options[i].hidden) {
+          psel.selectedIndex = i;
+          state.pair = psel.value;
+          break;
+        }
+      }
+    }
+  }
+  (function initMarketMode() {
+    var msel = document.getElementById('marketSelect');
+    var saved = null;
+    try { saved = localStorage.getItem('smc-market-mode'); } catch (e) {}
+    if (msel) {
+      if (saved === 'CRYPTO' || saved === 'FX') msel.value = saved;
+      else msel.value = isCryptoPair(state.pair) ? 'CRYPTO' : 'FX';
+      msel.onchange = function () {
+        applyMarketFilter();
+        stopForexWS();
+        try { if (state.ws && state.ws.sock) state.ws.sock.close(); } catch (e) {}
+        refreshData();
+        setTimeout(function () {
+          if (isCryptoPair(state.pair)) startCryptoWS();
+          else startForexWS();
+        }, 600);
+      };
+    }
+    applyMarketFilter();
+  })();
+  refreshData();
   });
   document.getElementById('brokerRow').addEventListener('click', function (e) {
     var chip = e.target.closest('.broker-chip');
