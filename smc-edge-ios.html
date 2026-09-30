@@ -1660,6 +1660,26 @@
       }
     }
 
+    // —— 4b) Cobertura mínima: el rango no puede ser una fracción del swing mayor visible ——
+    // Si el rango elegido es < 40% del tramo entre el máximo y el mínimo de la ventana (y el precio sigue
+    // dentro de ese tramo), es una pierna menor: se usa el swing mayor (alto/bajo estructural de la ventana).
+    (function () {
+      var nC = candles.length, wStart = Math.max(0, nC - lookback), WH = -Infinity, WL = Infinity, WHi = wStart, WLi = wStart, w0;
+      for (w0 = wStart; w0 < nC; w0++) {
+        if (candles[w0].high > WH) { WH = candles[w0].high; WHi = w0; }
+        if (candles[w0].low < WL) { WL = candles[w0].low; WLi = w0; }
+      }
+      var winSpan = WH - WL;
+      if (!(winSpan > 0) || winSpan > maxSpan) return;
+      var inside = lastBar.close <= WH + atr * 0.12 && lastBar.close >= WL - atr * 0.12;
+      if (inside && (actHigh - actLow) < winSpan * 0.4 && Math.abs(WHi - WLi) >= 3) {
+        actHigh = WH; actHighIdx = WHi;
+        actLow = WL; actLowIdx = WLi;
+        candidate.source = 'MAJOR_LEG';
+        candidate.score = Math.max(candidate.score, 60);
+      }
+    })();
+
     // —— 5) Invalidación por cierre de cuerpo fuera del rango ——
     var status = 'ACTIVE';
     if (lastBar.close > actHigh + atr * 0.12) {
