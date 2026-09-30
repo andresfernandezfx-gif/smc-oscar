@@ -175,7 +175,7 @@
 
 <div class="app">
   <header class="header">
-    <div class="logo">SMC - Oscar</div>
+    <div class="logo">SMC - Oscar <span id="buildTag" style="font-size:9px;font-weight:600;color:var(--muted);opacity:.8">v30sep-4</span></div>
     <span id="fxSessionBadge" style="font-size:10px;font-weight:600;color:var(--muted);white-space:nowrap"></span>
     <select class="pair-select" id="marketSelect" style="max-width:72px">
       <option value="FX">FX</option>
@@ -3635,6 +3635,12 @@
         liquidity: state.liquidity
       });
     } catch (ePb) { state.playbooks = null; }
+    // Datos no reales o viejos (semilla / sin red): no mostrar plan A/B ni entradas
+    state.dataUnreliable = !!(state.approxCandles || candleDataStale());
+    if (state.dataUnreliable) {
+      state.playbooks = null;
+      state.planLevels = null;
+    }
 
     // —— MTF Top-Down ——
     // Guardar score crudo del motor (antes de bonus MTF) para referencia
@@ -3654,6 +3660,10 @@
           state.smcSetup.hasSetup = false;
           state.smcSetup.why = (state.mtf.note || 'MTF no alineado') + ' — sin entrada sniper.';
         }
+      }
+      if (state.dataUnreliable && state.smcSetup) {
+        state.smcSetup.hasSetup = false;
+        state.smcSetup.why = 'Datos no reales/actuales (sin conexión a la fuente de precios) — no operar.';
       }
       // Barra MTF DESPUÉS de sincronizar score (evita "score 8" vs "score 18")
       renderMTFBar();
