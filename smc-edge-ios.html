@@ -512,6 +512,112 @@
     } catch (e) { return null; }
   }
 
+  /* ========== Twelve Data (gratis: 8 llamadas/min, 800/día; WebSocket solo de prueba) ========== */
+  function getTdKey() {
+    try { return localStorage.getItem('smc-td-key') || ''; } catch (e) { return ''; }
+  }
+  function tdSymbol(pair) {
+    pair = (pair || 'EURUSD').replace('/', '').toUpperCase();
+    return pair.length === 6 ? pair.slice(0, 3) + '/' + pair.slice(3) : pair;
+  }
+  var TD_DAILY_LIMIT = 780; // margen bajo los 800 del plan gratis
+  function tdUsage() {
+    var day = new Date().toISOString().slice(0, 10), u = null;
+    try { u = JSON.parse(localStorage.getItem('smc-td-usage') || 'null'); } catch (e) {}
+    if (!u || u.day !== day) u = { day: day, n: 0 };
+    return u;
+  }
+  function tdCountCall() {
+    var u = tdUsage(); u.n++;
+    try { localStorage.setItem('smc-td-usage', JSON.stringify(u)); } catch (e) {}
+    return u.n;
+  }
+  function tdRemaining() { return Math.max(0, TD_DAILY_LIMIT - tdUsage().n); }
+  // Ritmo adaptativo: reparte el cupo diario para que dure toda la sesión
+  function tdMinInterval() {
+    var r = tdRemaining();
+    if (r > 600) return 10000;
+    if (r > 300) return 20000;
+    if (r > 60) return 45000;
+    return Infinity;
+  }
+  function fetchTdPrice(pair) {
+    return new Promise(function (resolve) {
+      var key = getTdKey();
+      if (!key || isCryptoPair(pair) || state._tdBlockedUntil > Date.now()) { resolve(null); return; }
+      var now = Date.now();
+      var gap = tdMinInterval();
+      if (gap === Infinity) { resolve(null); return; }
+      // Aún dentro del ritmo permitido: devolver el último precio TD (sin gastar cupo)
+      if (state._tdLast && state._tdLast.pair === pair && now - state._tdLast.ts < gap) {
+        resolve(now - state._tdLast.ts < 90000 ? state._tdLast.px : null);
+        return;
+      }
+      if (state._tdBusy && now - (state._tdBusySince || 0) < 8000) { resolve(state._tdLast && state._tdLast.pair === pair ? state._tdLast.px : null); return; }
+      state._tdBusy = true; state._tdBusySince = now;
+      tdCountCall();
+      fetchWithTimeout('https://api.twelvedata.com/price?symbol=' + encodeURIComponent(tdSymbol(pair)) +
+        '&apikey=' + encodeURIComponent(key), 6000).then(function (j) {
+        state._tdBusy = false;
+        if (j && j.status === 'error') {
+          state.tdError = j.message || ('Error ' + j.code);
+          state._tdBlockedUntil = Date.now() + (j.code === 429 ? 65000 : 600000);
+          resolve(null); return;
+        }
+        var px = j && j.price ? parseFloat(j.price) : NaN;
+        if (px > 0) {
+          state.tdError = null;
+          state._tdLast = { pair: pair, px: px, ts: Date.now() };
+          resolve(px);
+        } else resolve(null);
+      }).catch(function () { state._tdBusy = false; resolve(null); });
+    });
+  }
+
+  function tdInterval(tf) {
+    return tf === '5m' ? '5min' : tf === '15m' ? '15min' : tf === '1h' ? '1h' : tf === '4h' ? '4h' : '1day';
+  }
+  state._tdCandleCache = {};
+  /** Velas reales OHLC desde Twelve Data (1 crédito por llamada; caché 4 min por par/TF) */
+  function fetchTdCandles(pair, tf, maxBarsOverride) {
+    return new Promise(function (resolve) {
+      var key = getTdKey();
+      if (!key || isCryptoPair(pair) || state._tdBlockedUntil > Date.now() || tdRemaining() < 20) { resolve(null); return; }
+      var ck = pair + '|' + tf, c = state._tdCandleCache[ck], now = Date.now();
+      if (!maxBarsOverride && c && now - c.ts < 240000) {
+        resolve(c.data.map(function (x) { return { time: x.time, open: x.open, high: x.high, low: x.low, close: x.close }; }));
+        return;
+      }
+      var size = Math.min(maxBarsOverride || (tf === '4h' ? 120 : tf === '1D' ? 180 : 150), 1500);
+      tdCountCall();
+      fetchWithTimeout('https://api.twelvedata.com/time_series?symbol=' + encodeURIComponent(tdSymbol(pair)) +
+        '&interval=' + tdInterval(tf) + '&outputsize=' + size + '&order=asc&timezone=UTC&apikey=' + encodeURIComponent(key), 9000)
+        .then(function (j) {
+          if (j && j.status === 'error') {
+            state.tdError = j.message || ('Error ' + j.code);
+            state._tdBlockedUntil = Date.now() + (j.code === 429 ? 65000 : 600000);
+            resolve(null); return;
+          }
+          var vals = j && j.values;
+          if (!vals || vals.length < 11) { resolve(null); return; }
+          var out = [];
+          vals.forEach(function (v) {
+            var d = v.datetime || '';
+            var ts = Math.floor(new Date(d.length <= 10 ? d + 'T00:00:00Z' : d.replace(' ', 'T') + 'Z').getTime() / 1000);
+            var o = parseFloat(v.open), h = parseFloat(v.high), l = parseFloat(v.low), cl = parseFloat(v.close);
+            if (isNaN(ts) || isNaN(o) || isNaN(cl)) return;
+            out.push({ time: ts, open: o, high: h, low: l, close: cl });
+          });
+          out.sort(function (a, b) { return a.time - b.time; });
+          if (out.length < 11) { resolve(null); return; }
+          state.tdError = null;
+          state.liveSource = 'Twelve Data';
+          if (!maxBarsOverride) state._tdCandleCache[ck] = { ts: Date.now(), data: out };
+          resolve(out);
+        }).catch(function () { resolve(null); });
+    });
+  }
+
   function fetchSpotPrice(pair) {
     return new Promise(function (resolve) {
       if (isCryptoPair(pair)) {
@@ -525,6 +631,15 @@
     });
   }
   function fetchSpotPriceFx(pair) {
+    if (getTdKey()) {
+      return fetchTdPrice(pair).then(function (px) {
+        if (px > 0) { state.liveSource = 'Twelve Data'; return px; }
+        return fetchSpotPriceFxRace(pair);
+      });
+    }
+    return fetchSpotPriceFxRace(pair);
+  }
+  function fetchSpotPriceFxRace(pair) {
     return new Promise(function (resolve) {
       var settled = false;
       function win(px) {
@@ -571,22 +686,21 @@
             'https://api.frankfurter.dev/v1/latest?base=' + base + '&symbols=' + quote,
             'https://open.er-api.com/v6/latest/' + base
           ];
-          fxUrls.forEach(function (fUrl) {
-            fetch(fUrl).then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
-              if (!j) return;
-              if (j.rates && j.rates[quote]) win(+j.rates[quote]);
-            }).catch(function () {});
-          });
+          // Son tasas DIARIAS (no tick real): solo si Yahoo no respondió en 5s, para no ensuciar la vela en vivo
+          setTimeout(function () {
+            if (settled) return;
+            fxUrls.forEach(function (fUrl) {
+              fetch(fUrl).then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
+                if (!j) return;
+                if (j.rates && j.rates[quote]) win(+j.rates[quote]);
+              }).catch(function () {});
+            });
+          }, 5000);
         }
       } catch (eF) {}
 
       // Fallback: último close del chart en memoria (no ideal, evita UI congelada)
-      setTimeout(function () {
-        if (!settled && state.candles && state.candles.length) {
-          var last = state.candles[state.candles.length - 1].close;
-          if (last > 0) win(last);
-        }
-      }, 8500);
+      // (Se eliminó el respaldo "último close en memoria": hacía pasar datos viejos por precio en vivo)
     });
   }
 
@@ -726,6 +840,7 @@
           var msg = JSON.parse(ev.data);
           var px = msg && msg.p ? +msg.p : null;
           if (px > 0) {
+            state._lastWsTick = Date.now();
             applySpotToLastCandle(px);
             state.lastUpdateTs = Date.now();
             state.liveSource = 'Binance WS';
@@ -757,7 +872,10 @@
       }
       fetchOandaCandles(pair, tf, maxBarsOverride || 150).then(function (od) {
         if (od && od.length > 10) { resolve(od); return; }
-        fetchLiveCandlesLegacy(pair, tf, maxBarsOverride).then(resolve);
+        fetchTdCandles(pair, tf, maxBarsOverride).then(function (td) {
+          if (td && td.length > 10) { resolve(td); return; }
+          fetchLiveCandlesLegacy(pair, tf, maxBarsOverride).then(resolve);
+        });
       });
     });
   }
@@ -1257,7 +1375,7 @@
   }
 
 
-  function detectStructuralRange(candles, swings, atr, tf, bosEvents) {
+  function detectStructuralRange(candles, swings, atr, tf, bosEvents, bias) {
     // Rango operativo SMC v3: extremos estructurales fuertes (no máximos/mínimos locales)
     // - Swing Low: mínimo que originó CHoCH/BOS alcista (preferible con sweep de liquidez)
     // - Swing High: máximo absoluto previo a un retroceso confirmado (rotura interna a la baja)
@@ -1276,6 +1394,51 @@
     var lastBar = candles[candles.length - 1];
     var minSpan = atr * 1.8;
 
+    // —— 0) Extremos MAYORES (no mínimos/máximos locales) ——
+    // Ventana de búsqueda por TF y tope de amplitud para que el rango no sea absurdo
+    var lookMap = { '1m': 240, '5m': 220, '15m': 180, '1h': 140, '4h': 110, '1d': 90 };
+    var lookback = lookMap[tf] || 180;
+    var maxSpan = atr * 32;
+    function majorLowBefore(idx, floorPrice) {
+      // swing low más bajo dentro de la ventana previa a idx que mantiene un rango válido
+      var best = null;
+      for (var q = 0; q < lows.length; q++) {
+        var L0 = lows[q];
+        if (L0.idx >= idx || L0.idx < idx - lookback) continue;
+        if (best && L0.price >= best.price) continue;
+        // no debe haber cierre por debajo del low después de formarse (si no, ya fue roto)
+        var broken = false;
+        for (var k = L0.idx + 1; k < candles.length; k++) {
+          if (candles[k].close < L0.price - atr * 0.12) { broken = true; break; }
+        }
+        if (broken) continue;
+        // el rango resultante no puede ser desproporcionado
+        var hiAfter = -Infinity;
+        for (var k2 = L0.idx; k2 < candles.length; k2++) if (candles[k2].high > hiAfter) hiAfter = candles[k2].high;
+        if (hiAfter - L0.price > maxSpan) continue;
+        best = L0;
+      }
+      return best;
+    }
+    function majorHighBefore(idx) {
+      var best = null;
+      for (var q = 0; q < highs.length; q++) {
+        var H0 = highs[q];
+        if (H0.idx >= idx || H0.idx < idx - lookback) continue;
+        if (best && H0.price <= best.price) continue;
+        var broken = false;
+        for (var k = H0.idx + 1; k < candles.length; k++) {
+          if (candles[k].close > H0.price + atr * 0.12) { broken = true; break; }
+        }
+        if (broken) continue;
+        var loAfter = Infinity;
+        for (var k2 = H0.idx; k2 < candles.length; k2++) if (candles[k2].low < loAfter) loAfter = candles[k2].low;
+        if (H0.price - loAfter > maxSpan) continue;
+        best = H0;
+      }
+      return best;
+    }
+
     // —— 1) Anclas estructurales desde BOS/CHoCH ——
     // CHoCH/BOS up → el swing low roto (o el mínimo del impulso) es origen alcista
     // CHoCH/BOS down → el swing high es origen bajista
@@ -1293,6 +1456,9 @@
           if (sw.idx < e.idx && (!bestL || sw.idx > bestL.idx)) bestL = sw;
         }
         if (bestL) {
+          // Sustituir el mínimo menor por el swing low MAYOR que originó el impulso
+          var majL = majorLowBefore(e.idx + 1);
+          if (majL && majL.price < bestL.price) bestL = majL;
           // bonus si hubo barrido (mecha bajo un low previo)
           var swept = false;
           var prevLow = null;
@@ -1313,6 +1479,8 @@
           if (sw.idx < e.idx && (!bestH || sw.idx > bestH.idx)) bestH = sw;
         }
         if (bestH) {
+          var majH = majorHighBefore(e.idx + 1);
+          if (majH && majH.price > bestH.price) bestH = majH;
           bearAnchors.push({
             highPrice: bestH.price, highIdx: bestH.idx, confirmIdx: e.idx,
             strength: (e.type === 'MSS' ? 30 : e.type === 'CHoCH' ? 25 : 18)
@@ -1381,6 +1549,7 @@
           high: absHigh, low: ba.lowPrice,
           highIdx: absHighIdx, lowIdx: ba.lowIdx,
           score: ba.strength + 40,
+          pref: (bias === 'BULLISH' ? 25 : (bias === 'BEARISH' ? -25 : 0)),
           source: 'BULL_ANCHOR',
           confirmedHigh: maxH ? isConfirmedHigh(maxH) : false
         };
@@ -1404,7 +1573,9 @@
       }
       if (baa.highPrice - absLow >= minSpan) {
         var scoreB = baa.strength + 40;
-        if (!candidate || scoreB >= candidate.score) {
+        // El sesgo (bias) desempata: alcista favorece el rango alcista, bajista el bajista
+        var prefBear = bias === 'BEARISH' ? 25 : (bias === 'BULLISH' ? -25 : 0);
+        if (!candidate || scoreB + prefBear >= candidate.score + (candidate.pref || 0)) {
           candidate = {
             high: baa.highPrice, low: absLow,
             highIdx: baa.highIdx, lowIdx: absLowIdx,
@@ -1543,12 +1714,13 @@
     };
   }
 
-  function detectDealingRange(swings, lastPrice) {
+  function detectDealingRange(swings, lastPrice, atr) {
     // fallback simple si no hay structural range aún
     if (!swings || swings.length < 2) {
       return { high: null, low: null, eq: null, zone: 'NEUTRAL', oteLow: null, oteHigh: null };
     }
-    var recent = swings.slice(-6);
+    // ventana más amplia (12 swings) para capturar el rango mayor, no solo la última pierna
+    var recent = swings.slice(-12);
     var hi = -Infinity, lo = Infinity;
     recent.forEach(function (s) {
       if (s.price > hi) hi = s.price;
@@ -2316,7 +2488,7 @@
           continue;
         }
         st = detectStructure(candles, tf === '5m' ? '15m' : tf);
-        range = detectStructuralRange(candles, st.swings, st.atr, tf, st.bosEvents) || detectDealingRange(st.swings, candles[candles.length - 1].close);
+        range = detectStructuralRange(candles, st.swings, st.atr, tf, st.bosEvents, st.bias) || detectDealingRange(st.swings, candles[candles.length - 1].close, st.atr);
         zone = range ? (range.zone || '—') : '—';
         layers[tf] = {
           bias: st.bias || 'NEUTRAL',
@@ -2737,8 +2909,8 @@
     var st = detectStructure(candles, tf);
     var liq = detectLiquidity(candles, st.swings, st.atr);
     var lastPx = candles[candles.length - 1].close;
-    var structural = detectStructuralRange(candles, st.swings, st.atr, tf, st.bosEvents);
-    var range = structural || detectDealingRange(st.swings, lastPx);
+    var structural = detectStructuralRange(candles, st.swings, st.atr, tf, st.bosEvents, st.bias);
+    var range = structural || detectDealingRange(st.swings, lastPx, st.atr);
     var fvgs = detectFVGs(candles);
     var obs = detectOBs(candles);
     fvgs.forEach(function (f) {
@@ -2920,9 +3092,10 @@
       ctx.font = '600 8px -apple-system,sans-serif';
       ctx.textAlign = 'right';
       ctx.fillStyle = 'rgba(239,68,68,0.55)';
-      ctx.fillText('PREMIUM', rx2 - 4, Math.max(ryH + 10, (ryH + ryE) / 2));
+      // PREMIUM pegado bajo RH; DISCOUNT pegado sobre RL (fuera del cruce con EQ e Inválido)
+      ctx.fillText('PREMIUM', rx2 - 4, ryH + 10);
       ctx.fillStyle = 'rgba(34,197,94,0.55)';
-      ctx.fillText('DISCOUNT', rx2 - 4, Math.min(ryL - 2, (ryE + ryL) / 2));
+      ctx.fillText('DISCOUNT', rx2 - 4, ryL - 4);
     }
 
     // --- Liquidez: BSL / SSL / EQH / EQL (líneas cortas + label) ---
@@ -3177,8 +3350,27 @@
         ctx.fillStyle = '#f87171';
         ctx.font = '600 9px -apple-system,sans-serif';
         ctx.textAlign = 'right';
-        ctx.fillText('Inválido > ' + inv.toFixed(decSc), w - padR - 4, yInv - 4);
+        // LONG: invalida por debajo (etiqueta bajo la línea). SHORT: por encima (etiqueta sobre la línea).
+        var invLong = state.bias === 'BULLISH' || (state.planLevels && state.planLevels.direction === 'LONG');
+        ctx.fillText((invLong ? 'Inválido < ' : 'Inválido > ') + inv.toFixed(decSc),
+          w - padR - 4, invLong ? yInv + 11 : yInv - 4);
       }
+    }
+
+    // Aviso grande si los datos no son reales/actuales
+    if (candleDataStale() || state.approxCandles) {
+      ctx.save();
+      ctx.fillStyle = 'rgba(15,23,42,0.88)';
+      ctx.fillRect(padL, padT + 4, Math.min(chartW, 330), 34);
+      ctx.strokeStyle = '#f59e0b';
+      ctx.strokeRect(padL, padT + 4, Math.min(chartW, 330), 34);
+      ctx.fillStyle = '#fbbf24';
+      ctx.font = '700 11px -apple-system,sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('⚠ DATOS NO ACTUALES — no operar con este gráfico', padL + 8, padT + 19);
+      ctx.font = '500 10px -apple-system,sans-serif';
+      ctx.fillText('Sin conexión a la fuente de precios (abre el archivo en Safari)', padL + 8, padT + 32);
+      ctx.restore();
     }
 
     // RR badge sniper
@@ -3350,13 +3542,25 @@
     var n = state.candles ? state.candles.length : 0;
     var ageMs = state.lastUpdateTs ? (Date.now() - state.lastUpdateTs) : null;
     var isStale = state.dataSource === 'live' && ageMs != null && ageMs > STALE_MS;
-    if (state.dataSource === 'live') {
+    var oldData = candleDataStale();
+    if (oldData) {
+      if (dot) { dot.classList.remove('live'); dot.classList.add('stale'); }
+      if (src) {
+        var lc = state.candles[state.candles.length - 1];
+        var ld = new Date(lc.time * 1000);
+        var ldStr = ld.toLocaleDateString('es', { day: '2-digit', month: 'short' }) + ' ' +
+          ld.toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' });
+        src.textContent = '⚠ SIN RED / DATOS VIEJOS · última vela ' + ldStr + ' · ' + state.pair + ' ' + state.tf;
+      }
+    } else if (state.dataSource === 'live') {
       if (dot) { dot.classList.toggle('live', !isStale); dot.classList.toggle('stale', isStale); }
       if (src) {
         var lastPx = (state.candles && state.candles.length) ? state.candles[state.candles.length - 1].close : null;
         var dec = (state.pair.indexOf('JPY') >= 0 || state.pair === 'XAUUSD') ? 2 : 5;
         var pxStr = lastPx != null ? (' · ' + (+lastPx).toFixed(dec)) : '';
-        if (isStale) {
+        if (state.approxCandles) {
+          src.textContent = '⚠ APROX · velas NO reales (solo precio real) · ' + state.pair + ' ' + state.tf + pxStr;
+        } else if (isStale) {
           var agoS = Math.round(ageMs / 1000);
           src.textContent = '⚠ Sin actualizar hace ' + agoS + 's · ' + state.pair + ' ' + state.tf + pxStr;
         } else {
@@ -3459,7 +3663,7 @@
       else if (c.dir === 'LONG' && +c.entry <= lastPx) distOk = d <= maxDist;
       else distOk = d <= atrN * (isLtfNow ? 1.5 : 2.5);
     }
-    var entryNear = !!distOk;
+    var entryNear = !!distOk && !candleDataStale() && !state.approxCandles;
     if (entryNear) {
       state.planLevels = {
         entry: +c.entry, sl: +c.sl, tp: +c.tp, tp2: c.tp2 ? +c.tp2 : null,
@@ -3549,15 +3753,32 @@
     state.structurePair = state.pair;
   }
 
+  /** true si la última vela es demasiado vieja para un mercado abierto (sin red / semilla / feed congelado) */
+  function candleDataStale() {
+    try {
+      var c = state.candles;
+      if (!c || !c.length) return false;
+      var last = c[c.length - 1];
+      var open = isCryptoPair(state.pair) ? true : (isForexMarketOpen().open);
+      if (!open) return false;
+      var age = Math.floor(Date.now() / 1000) - last.time;
+      return age > tfSeconds(state.tf) * 3 + 900;
+    } catch (e) { return false; }
+  }
+  function tfSeconds(tf) {
+    return tf === '5m' ? 300 : tf === '15m' ? 900 : tf === '1h' ? 3600 : tf === '4h' ? 14400 : 86400;
+  }
   function applySpotToLastCandle(spot) {
     if (!spot || !state.candles || !state.candles.length) return;
     var last = state.candles[state.candles.length - 1];
+    var interval = tfSeconds(state.tf);
     var now = Math.floor(Date.now() / 1000);
-    var interval = state.tf === '5m' ? 300 : state.tf === '15m' ? 900 : state.tf === '1h' ? 3600 : state.tf === '4h' ? 14400 : 86400;
-    // Si la última vela ya expiró, abrir una nueva
-    if (now - last.time >= interval) {
+    // Bucket alineado al reloj (como TradingView), no last.time + interval
+    var bucket = Math.floor(now / interval) * interval;
+    if (bucket > last.time) {
+      // Vela nueva: abre en el último close (sin huecos); si pasaron varias, no se inventan velas intermedias
       state.candles.push({
-        time: last.time + interval,
+        time: bucket,
         open: last.close,
         high: Math.max(last.close, spot),
         low: Math.min(last.close, spot),
@@ -3569,7 +3790,29 @@
       if (spot > last.high) last.high = spot;
       if (spot < last.low) last.low = spot;
     }
+    state._lastTickPx = spot;
+    state._lastTickTs = Date.now();
     basePrices[state.pair] = spot;
+  }
+
+  /** Fusiona velas recientes del broker (incluye la vela en formación) sobre state.candles */
+  function mergeLiveCandles(fresh) {
+    if (!fresh || !fresh.length || !state.candles || !state.candles.length) return false;
+    var byTime = {}, k;
+    for (k = 0; k < state.candles.length; k++) byTime[state.candles[k].time] = k;
+    var changed = false;
+    fresh.forEach(function (c) {
+      if (byTime[c.time] != null) {
+        state.candles[byTime[c.time]] = c;
+        changed = true;
+      } else if (c.time > state.candles[state.candles.length - 1].time) {
+        state.candles.push(c);
+        changed = true;
+      }
+    });
+    if (state.candles.length > 250) state.candles = state.candles.slice(-250);
+    if (changed) basePrices[state.pair] = state.candles[state.candles.length - 1].close;
+    return changed;
   }
 
   function synthesize5mFrom15m(c15) {
@@ -3671,6 +3914,7 @@
     return fetchLiveCandles(state.pair, state.tf, null).then(function (data) {
       if (data && data.length > 10) {
         state.candles = data;
+        state.approxCandles = false;
         state.dataSource = 'live';
         state.lastUpdateTs = Date.now();
         state.liveSource = state.liveSource || 'Yahoo FX';
@@ -3697,6 +3941,7 @@
           state.dataSource = 'live';
           state.lastUpdateTs = Date.now();
           state.liveSource = 'Spot RT + estructura';
+          state.approxCandles = true; // velas de semilla desplazadas: NO son reales
           basePrices[state.pair] = spot;
           setDataSourceUI();
           applyAnalysis();
@@ -3707,6 +3952,7 @@
           state.dataSource = 'live';
           state.lastUpdateTs = Date.now();
           state.liveSource = 'Spot RT';
+          state.approxCandles = true;
           basePrices[state.pair] = spot;
           setDataSourceUI();
           applyAnalysis();
@@ -3737,6 +3983,7 @@
           state.dataSource = 'live';
           state.lastUpdateTs = Date.now();
           state.liveSource = 'Spot RT + estructura';
+          state.approxCandles = true;
           basePrices[state.pair] = spot;
           setDataSourceUI();
           applyAnalysis();
@@ -3798,12 +4045,56 @@
   function refreshData() {
     // Cambio de par/TF: reset de estructura + carga completa
     clearStructureForNewContext();
+    state.approxCandles = false;
     loadCandlesOnce(true).then(function () {
       startRealtime();
     });
   }
 
+  function wsIsHealthy() {
+    return !!(state.ws && state.ws.connected && state._lastWsTick && Date.now() - state._lastWsTick < 15000);
+  }
+  function tickOandaLive() {
+    // Vela en formación desde OANDA (precio real de broker) cada pocos segundos
+    if (state._oandaBusy) {
+      if (state._oandaBusySince && Date.now() - state._oandaBusySince > 10000) state._oandaBusy = false;
+      else return Promise.resolve(false);
+    }
+    state._oandaBusy = true;
+    state._oandaBusySince = Date.now();
+    var pairAtCall = state.pair, tfAtCall = state.tf;
+    return fetchOandaCandles(pairAtCall, tfAtCall, 3).then(function (fresh) {
+      state._oandaBusy = false;
+      if (pairAtCall !== state.pair || tfAtCall !== state.tf) return false; // cambió el contexto
+      if (fresh && fresh.length && mergeLiveCandles(fresh)) {
+        state._lastTickTs = Date.now();
+        state.dataSource = 'live';
+        state.lastUpdateTs = Date.now();
+        state.spotFailStreak = 0;
+        state._rtTicks = (state._rtTicks || 0) + 1;
+        setDataSourceUI();
+        drawChart();
+        if (state._rtTicks % 2 === 0) applyAnalysis();
+        return true;
+      }
+      return false;
+    }).catch(function () { state._oandaBusy = false; return false; });
+  }
+
   function tickRealtime() {
+    if (!state.live) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
+    // WebSocket sano → ya llega tick a tick, no hace falta polling
+    if (wsIsHealthy()) return;
+    // Forex con token OANDA: vela en formación real
+    if (!isCryptoPair(state.pair) && getOandaToken()) {
+      tickOandaLive().then(function (ok) { if (!ok) tickSpotFallback(); });
+      return;
+    }
+    tickSpotFallback();
+  }
+
+  function tickSpotFallback() {
     if (!state.live) return;
     if (state._spotBusy) {
       // anti-bloqueo: si lleva >12s ocupado, liberar
@@ -3858,17 +4149,11 @@
       state._candleBusy = false;
       state._candleBusySince = 0;
       if (data && data.length > 10) {
-        // Fusionar: mantener spot de última vela si es más reciente
-        var prevLast = state.candles && state.candles.length ? state.candles[state.candles.length - 1].close : null;
+        // Reemplazar historial y reaplicar el último tick si es reciente (evita "saltos atrás")
         state.candles = data;
-        if (prevLast && state.candles.length) {
-          var last = state.candles[state.candles.length - 1];
-          // si el spot local es más actual, conservar high/low path
-          if (Math.abs(prevLast - last.close) > 0 && state.liveSource && state.liveSource.indexOf('RT') >= 0) {
-            last.close = prevLast;
-            if (prevLast > last.high) last.high = prevLast;
-            if (prevLast < last.low) last.low = prevLast;
-          }
+        state.approxCandles = false;
+        if (state._lastTickPx && state._lastTickTs && Date.now() - state._lastTickTs < 90000) {
+          applySpotToLastCandle(state._lastTickPx);
         }
         state.dataSource = 'live';
         state.lastUpdateTs = Date.now();
@@ -3897,13 +4182,44 @@
     state.live = true;
     state._spotBusy = false;
     state._candleBusy = false;
-    // Spot cada 3s
-    state._spotTimer = setInterval(tickRealtime, 3000);
-    // Velas completas cada 30s
+    // Spot: 2s en FX (OANDA/Yahoo), 3s resto. Con WS sano el tick se omite solo.
+    state._spotTimer = setInterval(tickRealtime, isCryptoPair(state.pair) ? 3000 : 2000);
+    // Velas completas cada 30s (resincroniza historial)
     state._candleTimer = setInterval(pollCandlesRealtime, 30000);
+    // Stream tick a tick: Binance WS (crypto) o Finnhub WS (forex, si hay token)
+    ensureLiveStream();
     setTimeout(tickRealtime, 400);
     setTimeout(pollCandlesRealtime, 2000);
   }
+
+  function ensureLiveStream() {
+    try {
+      if (isCryptoPair(state.pair)) {
+        if (!state.ws || !state.ws.sock || state.ws.sock.readyState > 1) startCryptoWS();
+      } else {
+        try { state.fxSession = isForexMarketOpen(); } catch (e) {}
+        var sockOk = state.ws && state.ws.sock && state.ws.sock.readyState <= 1 &&
+          state.ws.symbol === liveWsSymbol(state.pair);
+        if (!sockOk) startForexWS();
+      }
+    } catch (e) {}
+  }
+  // Watchdog: si el WS se queda mudo >20s con mercado abierto, reconectar
+  setInterval(function () {
+    if (!state.live || (typeof document !== 'undefined' && document.hidden)) return;
+    if (isCryptoPair(state.pair)) return;
+    if (state.ws && state.ws.sock && state.fxSession && state.fxSession.open &&
+        state._lastWsTick && Date.now() - state._lastWsTick > 20000) {
+      try { state.ws.sock.close(); } catch (e) {}
+    }
+  }, 10000);
+  // Al volver a la app (iOS suspende timers/sockets en segundo plano): refrescar ya
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden || !state.live) return;
+    ensureLiveStream();
+    setTimeout(tickRealtime, 100);
+    setTimeout(pollCandlesRealtime, 400);
+  });
 
 
 
@@ -4356,6 +4672,11 @@
     html += '<select id="selOandaEnv" style="margin-bottom:8px"><option value="practice">Practice (demo)</option><option value="live">Live</option></select>';
     html += '<button type="button" class="btn btn-outline" id="btnSaveOanda" style="margin-bottom:12px">Guardar OANDA y recargar</button>';
     html += '<p style="font-size:12px;color:var(--muted);margin-bottom:8px">Fuente prioritaria: Yahoo FX / Stooq. Opcional: token gratis <strong>Finnhub</strong> (feed tipo OANDA, más cercano a TV).</p>';
+    html += '<p style="font-size:12px;color:var(--muted);margin-bottom:8px"><strong>Twelve Data</strong> (gratis, sin tarjeta): precio forex en vivo. Plan gratis: 8 llamadas/min y 800/día; la app reparte el cupo automáticamente.</p>';
+    html += '<input type="password" id="inpTdKey" placeholder="API key Twelve Data" value="" style="margin-bottom:6px">';
+    var tdU = tdUsage();
+    html += '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">' + (getTdKey() ? ('Uso hoy: ' + tdU.n + '/' + TD_DAILY_LIMIT + (state.tdError ? ' · ⚠ ' + escapeHtml(String(state.tdError)) : '') + (state._tdWsDisabled ? ' · WS no disponible en tu plan (usa REST)' : '')) : 'Sin key configurada') + '</div>';
+    html += '<button type="button" class="btn btn-outline" id="btnSaveTd" style="margin-bottom:12px">Guardar Twelve Data y recargar</button>';
     html += '<input type="text" id="inpFhToken" placeholder="Token Finnhub (opcional)" value="" style="margin-bottom:8px">';
     html += '<button type="button" class="btn btn-outline" id="btnSaveFh" style="margin-bottom:10px">Guardar token y recargar LIVE</button>';
     html += '<p style="font-size:13px;color:var(--muted);margin-bottom:8px">El chart es un <strong>motor propio</strong> (canvas) que dibuja tu análisis SMC (OB/FVG/BOS/zonas) sobre precios reales de Yahoo Finance / Stooq, con spot cada 5s y velas cada 45s. No es un widget embebido de TradingView — uso "Abrir en TV" para comparar el mismo símbolo ahí si quieres verificar spread/velas contra tu bróker. ';
@@ -4465,6 +4786,16 @@
     if (fhInp) {
       try { fhInp.value = localStorage.getItem('smc-fh-token') || ''; } catch (e) {}
     }
+    var tdInp = document.getElementById('inpTdKey');
+    if (tdInp) tdInp.value = getTdKey();
+    var btnTd = document.getElementById('btnSaveTd');
+    if (btnTd) btnTd.onclick = function () {
+      var v = (tdInp.value || '').trim();
+      try { if (v) localStorage.setItem('smc-td-key', v); else localStorage.removeItem('smc-td-key'); } catch (e) {}
+      state._tdWsDisabled = false; state._tdBlockedUntil = 0; state.tdError = null; state._tdLast = null;
+      alert(v ? 'Key Twelve Data guardada. Recargando…' : 'Key eliminada');
+      if (typeof refreshData === 'function') refreshData();
+    };
     var btnFh = document.getElementById('btnSaveFh');
     if (btnFh) btnFh.onclick = function () {
       var v = (document.getElementById('inpFhToken').value || '').trim();
@@ -5603,17 +5934,86 @@
       try { state.ws.sock.close(); } catch (e) {}
       state.ws.sock = null;
       state.ws.connected = false;
+      state.ws.symbol = null;
+      state._lastWsTick = 0;
     }
+  }
+  function liveWsSymbol(pair) {
+    var fh = ''; try { fh = localStorage.getItem('smc-fh-token') || ''; } catch (e) {}
+    return fh ? finnhubFxSymbol(pair) : ('TD:' + tdSymbol(pair));
+  }
+  // Twelve Data WS: el plan gratis solo incluye créditos WS de prueba; si falla se desactiva y queda REST
+  function startTwelveWS() {
+    var key = getTdKey();
+    if (!key || state._tdWsDisabled || !state.fxSession.open || typeof WebSocket === 'undefined') return;
+    try {
+      var wsPair = state.pair, sym = tdSymbol(wsPair);
+      var sock = new WebSocket('wss://ws.twelvedata.com/v1/quotes/price?apikey=' + encodeURIComponent(key));
+      state.ws.sock = sock;
+      state.ws.symbol = 'TD:' + sym;
+      var hb = null;
+      sock.onopen = function () {
+        state.ws.connected = true;
+        sock.send(JSON.stringify({ action: 'subscribe', params: { symbols: sym } }));
+        hb = setInterval(function () {
+          try { if (sock.readyState === 1) sock.send(JSON.stringify({ action: 'heartbeat' })); } catch (e) {}
+        }, 10000);
+      };
+      sock.onmessage = function (ev) {
+        try {
+          var m = JSON.parse(ev.data);
+          if (m.event === 'subscribe-status') {
+            if ((m.fails && m.fails.length) || m.status === 'error') {
+              state._tdWsDisabled = true;
+              try { sock.close(); } catch (e) {}
+            }
+            return;
+          }
+          if (m.event === 'price' && m.price != null && wsPair === state.pair) {
+            var px = parseFloat(m.price);
+            if (!(px > 0)) return;
+            state._lastWsTick = Date.now();
+            applySpotToLastCandle(px);
+            state.lastUpdateTs = Date.now();
+            state.dataSource = 'live';
+            state.liveSource = 'Twelve Data WS';
+            setDataSourceUI();
+            if (state.tab === 'chart' && !state._wsDrawBusy) {
+              state._wsDrawBusy = true;
+              requestAnimationFrame(function () { drawChart(); state._wsDrawBusy = false; });
+            }
+            if (!state._wsAnalysisTs || Date.now() - state._wsAnalysisTs > 2000) {
+              state._wsAnalysisTs = Date.now();
+              applyAnalysis();
+            }
+          } else if (m.event === 'error' || m.status === 'error') {
+            state._tdWsDisabled = true;
+            try { sock.close(); } catch (e) {}
+          }
+        } catch (e) {}
+      };
+      sock.onclose = function () {
+        if (hb) clearInterval(hb);
+        if (state.ws.sock === sock) state.ws.connected = false;
+        if (!state._tdWsDisabled && state.live && state.fxSession.open && wsPair === state.pair && !isCryptoPair(state.pair)) {
+          setTimeout(function () { if (!state.ws.connected) startForexWS(); }, 5000);
+        }
+      };
+      sock.onerror = function () { try { sock.close(); } catch (e) {} };
+    } catch (e) {}
   }
   function startForexWS() {
     stopForexWS();
     var token = '';
     try { token = localStorage.getItem('smc-fh-token') || ''; } catch (e) {}
-    if (!token || !state.fxSession.open) return;
+    if (!token) { startTwelveWS(); return; }
+    if (!state.fxSession.open) return;
     if (typeof WebSocket === 'undefined') return;
     try {
       var sock = new WebSocket('wss://ws.finnhub.io?token=' + encodeURIComponent(token));
       state.ws.sock = sock;
+      state.ws.symbol = finnhubFxSymbol(state.pair);
+      var wsPair = state.pair;
       sock.onopen = function () {
         state.ws.connected = true;
         var sym = finnhubFxSymbol(state.pair);
@@ -5627,21 +6027,35 @@
           if (msg.type === 'trade' && msg.data && msg.data.length) {
             var last = msg.data[msg.data.length - 1];
             var px = last.p;
-            if (px > 0) {
+            if (px > 0 && wsPair === state.pair) {
               state.ws.lastTick = px;
+              state._lastWsTick = Date.now();
               applySpotToLastCandle(px);
               state.lastUpdateTs = Date.now();
+              state.dataSource = 'live';
+              state.liveSource = 'Finnhub FX WS';
               setDataSourceUI();
-              if (state.tab === 'chart') drawChart();
+              if (state.tab === 'chart' && !state._wsDrawBusy) {
+                state._wsDrawBusy = true;
+                requestAnimationFrame(function () {
+                  drawChart();
+                  state._wsDrawBusy = false;
+                });
+              }
+              // Re-análisis SMC como máximo cada 2s
+              if (!state._wsAnalysisTs || Date.now() - state._wsAnalysisTs > 2000) {
+                state._wsAnalysisTs = Date.now();
+                applyAnalysis();
+              }
             }
           }
         } catch (e) {}
       };
       sock.onclose = function () {
-        state.ws.connected = false;
-        // Reconnect if live and market open
-        if (state.live && state.fxSession.open) {
-          setTimeout(function () { startForexWS(); }, 5000);
+        if (state.ws.sock === sock) state.ws.connected = false;
+        // Reconectar solo si sigue siendo el par activo, live y mercado abierto
+        if (state.live && state.fxSession.open && wsPair === state.pair && !isCryptoPair(state.pair)) {
+          setTimeout(function () { if (!state.ws.connected) startForexWS(); }, 4000);
         }
       };
       sock.onerror = function () { try { sock.close(); } catch (e) {} };
