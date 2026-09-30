@@ -175,7 +175,7 @@
 
 <div class="app">
   <header class="header">
-    <div class="logo">SMC - Oscar <span id="buildTag" style="font-size:9px;font-weight:600;color:var(--muted);opacity:.8">v30sep-4</span></div>
+    <div class="logo">SMC - Oscar <span id="buildTag" style="font-size:9px;font-weight:600;color:var(--muted);opacity:.8">v30sep-6</span></div>
     <span id="fxSessionBadge" style="font-size:10px;font-weight:600;color:var(--muted);white-space:nowrap"></span>
     <select class="pair-select" id="marketSelect" style="max-width:72px">
       <option value="FX">FX</option>
@@ -520,6 +520,16 @@
     pair = (pair || 'EURUSD').replace('/', '').toUpperCase();
     return pair.length === 6 ? pair.slice(0, 3) + '/' + pair.slice(3) : pair;
   }
+  state._tdStamps = [];
+  function tdActiveStamps() {
+    var now = Date.now();
+    state._tdStamps = state._tdStamps.filter(function (t) { return now - t < 60000; });
+    return state._tdStamps.length;
+  }
+  function tdWaitMs() {
+    if (tdActiveStamps() < 7) return 0;
+    return Math.max(200, 60000 - (Date.now() - state._tdStamps[0]) + 50);
+  }
   var TD_DAILY_LIMIT = 780; // margen bajo los 800 del plan gratis
   function tdUsage() {
     var day = new Date().toISOString().slice(0, 10), u = null;
@@ -528,6 +538,7 @@
     return u;
   }
   function tdCountCall() {
+    state._tdStamps.push(Date.now());
     var u = tdUsage(); u.n++;
     try { localStorage.setItem('smc-td-usage', JSON.stringify(u)); } catch (e) {}
     return u.n;
@@ -548,6 +559,10 @@
       var now = Date.now();
       var gap = tdMinInterval();
       if (gap === Infinity) { resolve(null); return; }
+      if (tdActiveStamps() >= 5) { // reserva 2 huecos/min para las velas de otros timeframes
+        resolve(state._tdLast && state._tdLast.pair === pair && now - state._tdLast.ts < 90000 ? state._tdLast.px : null);
+        return;
+      }
       // Aún dentro del ritmo permitido: devolver el último precio TD (sin gastar cupo)
       if (state._tdLast && state._tdLast.pair === pair && now - state._tdLast.ts < gap) {
         resolve(now - state._tdLast.ts < 90000 ? state._tdLast.px : null);
@@ -584,12 +599,25 @@
       var key = getTdKey();
       if (!key || isCryptoPair(pair) || state._tdBlockedUntil > Date.now() || tdRemaining() < 20) { resolve(null); return; }
       var ck = pair + '|' + tf, c = state._tdCandleCache[ck], now = Date.now();
-      if (!maxBarsOverride && c && now - c.ts < 240000) {
+      var ttl = tf === '5m' || tf === '15m' ? 240000 : tf === '1h' ? 600000 : tf === '4h' ? 1800000 : 3600000;
+      if (!maxBarsOverride && c && now - c.ts < ttl) {
         resolve(c.data.map(function (x) { return { time: x.time, open: x.open, high: x.high, low: x.low, close: x.close }; }));
         return;
       }
       var size = Math.min(maxBarsOverride || (tf === '4h' ? 120 : tf === '1D' ? 180 : 150), 1500);
-      tdCountCall();
+      var deadline = Date.now() + 40000;
+      (function attempt() {
+        var w = tdWaitMs();
+        if (w > 0) {
+          if (Date.now() + w > deadline) { resolve(null); return; }
+          setTimeout(attempt, Math.min(w, 8000));
+          return;
+        }
+        if (state._tdBlockedUntil > Date.now()) { resolve(null); return; }
+        tdCountCall();
+        tdRequest();
+      })();
+      function tdRequest() {
       fetchWithTimeout('https://api.twelvedata.com/time_series?symbol=' + encodeURIComponent(tdSymbol(pair)) +
         '&interval=' + tdInterval(tf) + '&outputsize=' + size + '&order=asc&timezone=UTC&apikey=' + encodeURIComponent(key), 9000)
         .then(function (j) {
@@ -615,6 +643,92 @@
           if (!maxBarsOverride) state._tdCandleCache[ck] = { ts: Date.now(), data: out };
           resolve(out);
         }).catch(function () { resolve(null); });
+      }
+    });
+  }
+
+  /** Velas REALES para los demás timeframes del panel MTF (antes salían de la semilla del 25 sep) */
+  function scheduleMtfPrefetch(force) {
+    try {
+      var canFetch = isCryptoPair(state.pair) || getTdKey() || getOandaToken();
+      if (!canFetch || state._mtfBusy || state.approxCandles) return;
+      var now = Date.now();
+      if (!force && state._mtfLastRun && state._mtfLastRun.pair === state.pair && now - state._mtfLastRun.ts < 240000) return;
+      state._mtfBusy = true;
+      state._mtfLastRun = { pair: state.pair, ts: now };
+      var pair = state.pair;
+      var tfs = ['4h', '1h', '15m', '5m'].filter(function (t) { return t !== state.tf; });
+      var i = 0, got = 0;
+      (function next() {
+        if (pair !== state.pair || i >= tfs.length) {
+          state._mtfBusy = false;
+          if (got && pair === state.pair) { try { applyAnalysis(); } catch (e) {} }
+          return;
+        }
+        var tf = tfs[i++];
+        fetchLiveCandles(pair, tf, null).then(function (d) {
+          if (d && d.length > 20) {
+            if (!state.mtfCache[pair]) state.mtfCache[pair] = {};
+            state.mtfCache[pair][tf] = d;
+            got++;
+          }
+        }).catch(function () {}).then(function () { setTimeout(next, 300); });
+      })();
+    } catch (e) { state._mtfBusy = false; }
+  }
+
+  /* ---------- Diagnóstico de conexiones (muestra el error real de cada fuente) ---------- */
+  function diagFetch(name, url, check) {
+    return new Promise(function (resolve) {
+      var t0 = Date.now(), done = false;
+      var timer = setTimeout(function () { if (!done) { done = true; resolve(name + ': ✗ timeout (>8s)'); } }, 8000);
+      fetch(url).then(function (r) {
+        return r.text().then(function (txt) { return { status: r.status, txt: txt }; });
+      }).then(function (o) {
+        if (done) return; done = true; clearTimeout(timer);
+        var ms = Date.now() - t0, verdict = '';
+        try { verdict = check ? check(o) : ''; } catch (e) { verdict = ''; }
+        var ok = o.status >= 200 && o.status < 300 && verdict !== 'bad';
+        resolve(name + ': ' + (ok ? '✓' : '✗') + ' HTTP ' + o.status + ' · ' + ms + 'ms' +
+          (verdict && verdict !== 'bad' && verdict !== 'ok' ? ' · ' + verdict : '') +
+          (!ok ? ' · ' + String(o.txt).replace(/\s+/g, ' ').slice(0, 90) : ''));
+      }).catch(function (e) {
+        if (done) return; done = true; clearTimeout(timer);
+        resolve(name + ': ✗ bloqueado/red (' + ((e && e.message) || 'fetch') + ') — CORS o sin conexión');
+      });
+    });
+  }
+  function runConnectionDiagnostics() {
+    var out = document.getElementById('diagOut');
+    if (!out) return;
+    out.textContent = 'Probando… (≈8 s)';
+    var yPath = 'https://query1.finance.yahoo.com/v8/finance/chart/EURUSD%3DX?interval=15m&range=1d';
+    var tests = [
+      diagFetch('Frankfurter (tasa diaria)', 'https://api.frankfurter.app/latest?from=EUR&to=USD', function (o) {
+        var j = JSON.parse(o.txt); return j.rates ? 'EURUSD ' + j.rates.USD + ' (diario, no en vivo)' : 'bad';
+      }),
+      diagFetch('Yahoo vía corsproxy.io', 'https://corsproxy.io/?' + encodeURIComponent(yPath), function (o) {
+        return o.txt.indexOf('"chart"') >= 0 ? 'ok' : 'bad';
+      }),
+      diagFetch('Yahoo vía allorigins', 'https://api.allorigins.win/raw?url=' + encodeURIComponent(yPath), function (o) {
+        return o.txt.indexOf('"chart"') >= 0 ? 'ok' : 'bad';
+      }),
+      diagFetch('Binance (crypto)', 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', function (o) {
+        var j = JSON.parse(o.txt); return j.price ? 'BTC ' + j.price : 'bad';
+      })
+    ];
+    var key = getTdKey();
+    if (key) {
+      tests.push(diagFetch('Twelve Data (velas)', 'https://api.twelvedata.com/time_series?symbol=EUR/USD&interval=15min&outputsize=3&timezone=UTC&apikey=' + encodeURIComponent(key), function (o) {
+        var j = JSON.parse(o.txt);
+        if (j.status === 'error') return 'bad';
+        return j.values && j.values.length ? 'última vela ' + j.values[0].datetime + ' UTC · close ' + j.values[0].close : 'bad';
+      }));
+    } else {
+      tests.push(Promise.resolve('Twelve Data: — sin key guardada (esta es la fuente que arregla las velas)'));
+    }
+    Promise.all(tests).then(function (r) {
+      out.textContent = r.join('\n') + '\n\nSi Yahoo falla y Twelve Data ✓ → las velas reales vendrán de Twelve Data.';
     });
   }
 
@@ -3579,7 +3693,9 @@
         var dec = (state.pair.indexOf('JPY') >= 0 || state.pair === 'XAUUSD') ? 2 : 5;
         var pxStr = lastPx != null ? (' · ' + (+lastPx).toFixed(dec)) : '';
         if (state.approxCandles) {
-          src.textContent = '⚠ APROX · velas NO reales (solo precio real) · ' + state.pair + ' ' + state.tf + pxStr;
+          var hint = !getTdKey() ? ' · Falta key Twelve Data (Herramientas)' :
+            (state.tdError ? ' · Twelve Data: ' + String(state.tdError).slice(0, 60) : ' · Ver Herramientas → Probar conexiones');
+          src.textContent = '⚠ APROX · velas NO reales · ' + state.pair + ' ' + state.tf + pxStr + hint;
         } else if (isStale) {
           var agoS = Math.round(ageMs / 1000);
           src.textContent = '⚠ Sin actualizar hace ' + agoS + 's · ' + state.pair + ' ' + state.tf + pxStr;
@@ -3945,6 +4061,7 @@
       if (data && data.length > 10) {
         state.candles = data;
         state.approxCandles = false;
+        setTimeout(function () { scheduleMtfPrefetch(true); }, 1200);
         state.dataSource = 'live';
         state.lastUpdateTs = Date.now();
         state.liveSource = state.liveSource || 'Yahoo FX';
@@ -4182,6 +4299,7 @@
         // Reemplazar historial y reaplicar el último tick si es reciente (evita "saltos atrás")
         state.candles = data;
         state.approxCandles = false;
+        setTimeout(scheduleMtfPrefetch, 1500);
         if (state._lastTickPx && state._lastTickTs && Date.now() - state._lastTickTs < 90000) {
           applySpotToLastCandle(state._lastTickPx);
         }
@@ -4707,6 +4825,8 @@
     var tdU = tdUsage();
     html += '<div style="font-size:11px;color:var(--muted);margin-bottom:6px">' + (getTdKey() ? ('Uso hoy: ' + tdU.n + '/' + TD_DAILY_LIMIT + (state.tdError ? ' · ⚠ ' + escapeHtml(String(state.tdError)) : '') + (state._tdWsDisabled ? ' · WS no disponible en tu plan (usa REST)' : '')) : 'Sin key configurada') + '</div>';
     html += '<button type="button" class="btn btn-outline" id="btnSaveTd" style="margin-bottom:12px">Guardar Twelve Data y recargar</button>';
+    html += '<button type="button" class="btn btn-outline" id="btnDiag" style="margin-bottom:8px">Probar conexiones (diagnóstico)</button>';
+    html += '<pre id="diagOut" style="font-size:11px;line-height:1.5;white-space:pre-wrap;color:var(--muted);margin:0 0 12px"></pre>';
     html += '<input type="text" id="inpFhToken" placeholder="Token Finnhub (opcional)" value="" style="margin-bottom:8px">';
     html += '<button type="button" class="btn btn-outline" id="btnSaveFh" style="margin-bottom:10px">Guardar token y recargar LIVE</button>';
     html += '<p style="font-size:13px;color:var(--muted);margin-bottom:8px">El chart es un <strong>motor propio</strong> (canvas) que dibuja tu análisis SMC (OB/FVG/BOS/zonas) sobre precios reales de Yahoo Finance / Stooq, con spot cada 5s y velas cada 45s. No es un widget embebido de TradingView — uso "Abrir en TV" para comparar el mismo símbolo ahí si quieres verificar spread/velas contra tu bróker. ';
@@ -4818,6 +4938,8 @@
     }
     var tdInp = document.getElementById('inpTdKey');
     if (tdInp) tdInp.value = getTdKey();
+    var btnDiag = document.getElementById('btnDiag');
+    if (btnDiag) btnDiag.onclick = function () { runConnectionDiagnostics(); };
     var btnTd = document.getElementById('btnSaveTd');
     if (btnTd) btnTd.onclick = function () {
       var v = (tdInp.value || '').trim();
