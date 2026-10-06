@@ -175,7 +175,7 @@
 
 <div class="app">
   <header class="header">
-    <div class="logo">SMC - Oscar <span id="buildTag" style="font-size:9px;font-weight:600;color:var(--muted);opacity:.8">v30sep-6</span></div>
+    <div class="logo">SMC - Oscar <span id="buildTag" style="font-size:9px;font-weight:600;color:var(--muted);opacity:.8">v06oct-AB</span></div>
     <span id="fxSessionBadge" style="font-size:10px;font-weight:600;color:var(--muted);white-space:nowrap"></span>
     <select class="pair-select" id="marketSelect" style="max-width:72px">
       <option value="FX">FX</option>
@@ -1100,12 +1100,16 @@
     fvgMinATR: 0.10,
     liqTolATR: 0.12,
     sweepDepthATR: 0.04,
-    minRR: 2.0,
+    minRR: 1.5,
     slBufferATR: 0.2,
     entryMode: 'limit',
-    fvgMinScore: 50,
-    obMinScore: 48,
-    setupMinScore: 85
+    fvgMinScore: 45,
+    obMinScore: 42,
+    setupMinScore: 75,
+    setupMinScoreB: 60,
+    setupMinScoreC: 50,
+    killzoneBonus: 15,
+    maxPoiAtrDist: 2.2
   };
 
   function calcATR(candles, len) {
@@ -2511,28 +2515,70 @@
 
     var why = 'SNIPER ' + grade + ' ' + dir + ' · RR 1:' + rr.toFixed(1) + ' — ' + reasons.slice(0, 3).join(' · ');
 
-    // Matriz win-rate: live estricto (>=80 + OTE + killzone); backtest algo más permisivo para estadística
+    // Niveles A / B / C — más señales útiles sin abrir a ruido extremo
     var isBT = !!ctx.backtest;
-    var minScoreLive = SMC_CFG.setupMinScore; // 80
-    var minScoreBT = 55;
-    var highProbLive = score >= minScoreLive && oteOk && (hasInducement || recentSweep) && (kz && kz.active);
-    var highProbBT = score >= minScoreBT && (bestOB || bestFVG) && rr >= 1.8;
-    var highProb = isBT ? highProbBT : highProbLive;
-    if (!isBT && score < 65) {
+    var minA = SMC_CFG.setupMinScore != null ? SMC_CFG.setupMinScore : 75;
+    var minB = SMC_CFG.setupMinScoreB != null ? SMC_CFG.setupMinScoreB : 60;
+    var minC = SMC_CFG.setupMinScoreC != null ? SMC_CFG.setupMinScoreC : 50;
+    var minScoreBT = 50;
+    // Killzone = bonus (no muro)
+    if (kz && kz.active) {
+      score = Math.min(100, score + (SMC_CFG.killzoneBonus || 15));
+      conf.push('Killzone ' + (kz.name || 'activa') + ' +' + (SMC_CFG.killzoneBonus || 15));
+    } else if (!isBT) {
+      conf.push('⚠️ Low Volume Window (fuera killzone)');
+    }
+    // Recalcular grade tras bonus
+    if (score >= 90) grade = 'A+';
+    else if (score >= 80) grade = 'A';
+    else if (score >= 70) grade = 'B';
+    else if (score >= 60) grade = 'C';
+    else grade = 'D';
+
+    // Distancia POI al precio: preferir entradas cercanas en LTF
+    var lastPxCtx = (candles && candles.length) ? candles[candles.length - 1].close : entry;
+    var poiDistAtr = atr > 0 ? Math.abs(entry - lastPxCtx) / atr : 99;
+    var maxDist = SMC_CFG.maxPoiAtrDist != null ? SMC_CFG.maxPoiAtrDist : 2.2;
+    var nearPoi = poiDistAtr <= maxDist;
+    if (!nearPoi) conf.push('POI lejos (' + poiDistAtr.toFixed(1) + ' ATR) — watch');
+
+    var hasPoi = !!(bestOB || bestFVG);
+    var ctxOk = !!(hasInducement || recentSweep || oteOk || score >= 70);
+    // Nivel A: sniper alta probabilidad
+    var levelA = !isBT && score >= minA && rr >= Math.max(minSniperRR, 2.0) && hasPoi && nearPoi && (oteOk || ctxOk);
+    // Nivel B: setup operable (más frecuente)
+    var levelB = !isBT && score >= minB && rr >= minSniperRR && hasPoi && (nearPoi || poiDistAtr <= maxDist * 1.4);
+    // Nivel C: watchlist
+    var levelC = !isBT && score >= minC && hasPoi && rr >= 1.3;
+    if (isBT) {
+      levelA = score >= 55 && hasPoi && rr >= 1.5;
+      levelB = score >= 50 && hasPoi && rr >= 1.3;
+      levelC = false;
+    }
+    var signalLevel = levelA ? 'A' : (levelB ? 'B' : (levelC ? 'C' : null));
+    var hasSetup = !!(levelA || levelB);
+    if (!hasSetup && !levelC) {
       return {
-        hasSetup: false, dir: dir, grade: null, score: score, conf: conf, reasons: reasons,
-        engineState: engineState, sniper: false,
-        entry: 0, sl: 0, tp: 0, tp2: 0, entryWhy: '', slWhy: '', tpWhy: '', rr: +rr.toFixed(2),
-        why: 'Score ' + score + ' < 65 — baja probabilidad. No proyectar E/SL/TP.'
+        hasSetup: false, dir: dir, grade: grade, score: score, conf: conf, reasons: reasons,
+        engineState: engineState, sniper: false, signalLevel: null,
+        entry: (score >= minC && hasPoi) ? entry : 0,
+        sl: (score >= minC && hasPoi) ? sl : 0,
+        tp: (score >= minC && hasPoi) ? tp : 0,
+        tp2: 0, entryWhy: entryWhy, slWhy: slWhy, tpWhy: tpWhy, rr: +rr.toFixed(2),
+        why: 'Score ' + score + ' — sin setup A/B. Esperando confluencia.'
       };
     }
-    var needScore = isBT ? minScoreBT : minScoreLive;
+    var lvlTag = signalLevel === 'A' ? 'SNIPER A' : (signalLevel === 'B' ? 'SETUP B' : 'WATCH C');
+    why = lvlTag + ' ' + grade + ' ' + dir + ' · RR 1:' + rr.toFixed(1) + ' — ' + reasons.slice(0, 3).join(' · ');
     return {
-      hasSetup: score >= needScore && grade !== 'C' && rr >= (isBT ? 1.8 : minSniperRR) && highProb,
+      hasSetup: hasSetup,
+      signalLevel: signalLevel,
       dir: dir, grade: grade, score: score, conf: conf, reasons: reasons,
-      engineState: engineState, sniper: true, oteOk: oteOk, inducement: hasInducement, killzone: !!(kz && kz.active),
+      engineState: engineState,
+      sniper: signalLevel === 'A',
+      oteOk: oteOk, inducement: hasInducement, killzone: !!(kz && kz.active),
       entry: entry, sl: sl, tp: tp, tp2: tp2, entryWhy: entryWhy, slWhy: slWhy, tpWhy: tpWhy, rr: +rr.toFixed(2),
-      why: why + (kz && !kz.active ? ' · ⚠️ Low Volume Window' : '')
+      why: why + (kz && !kz.active ? ' · ⚠️ Low Volume' : '') + (nearPoi ? '' : ' · POI distante')
     };
   }
 
@@ -2651,21 +2697,34 @@
     if (layers['5m'].bias === layers['15m'].bias && layers['15m'].bias !== 'NEUTRAL') {
       layers['5m'].synced = true;
     }
-    var ready = aligned >= 3 && macro !== 'NEUTRAL';
-    // Conflicto: CHoCH intermedio contra macro
+    // 1H + 15m alineados basta para operar (4H informativo, no veto absoluto)
+    var h1 = layers['1h'].bias;
+    var m15 = layers['15m'].bias;
+    var execAligned = h1 !== 'NEUTRAL' && m15 === h1;
+    var softReady = execAligned || (aligned >= 2 && macro !== 'NEUTRAL');
+    var ready = (aligned >= 3 && macro !== 'NEUTRAL') || (execAligned && macro === h1);
+    // Conflicto suave: 4H vs 1H — marca riesgo, no bloquea nivel B
     var conflict = false;
-    if (macro === 'BEARISH' && layers['1h'].bias === 'BULLISH') conflict = true;
-    if (macro === 'BULLISH' && layers['1h'].bias === 'BEARISH') conflict = true;
+    var contraMacro = false;
+    if (macro === 'BEARISH' && h1 === 'BULLISH') { contraMacro = true; }
+    if (macro === 'BULLISH' && h1 === 'BEARISH') { contraMacro = true; }
+    // Solo CONFLICT duro si 1H y 15m pelean entre sí
+    if (h1 === 'BULLISH' && m15 === 'BEARISH') conflict = true;
+    if (h1 === 'BEARISH' && m15 === 'BULLISH') conflict = true;
 
     return {
       macro: macro,
       layers: layers,
       aligned: aligned,
       ready: ready && !conflict,
+      softReady: softReady && !conflict,
       conflict: conflict,
+      contraMacro: contraMacro,
       note: conflict
-        ? 'CHoCH intermedio vs macro — entradas suspendidas'
-        : (ready ? 'MTF alineado (' + aligned + '/4) — sniper habilitado' : 'Esperando alineación MTF (' + aligned + '/4)')
+        ? '1H vs 15m en conflicto — pausa'
+        : (contraMacro
+          ? 'Contra-macro 4H — Setup B con riesgo alto'
+          : (ready ? 'MTF alineado (' + aligned + '/4)' : (softReady ? 'MTF parcial (1H+15m) — Setup B ok' : 'Esperando MTF (' + aligned + '/4)')))
     };
   }
 
@@ -2700,24 +2759,31 @@
     // alineado en dirección. Antes esto se mostraba con m.ready únicamente,
     // lo cual podía decir "SNIPER ON" con un score de 20/100 — corregido aquí.
     var setupOk = !!(state.smcSetup && state.smcSetup.hasSetup);
-    // Siempre state.score (global) — nunca un score paralelo desfasado
+    var lvl = state.smcSetup && state.smcSetup.signalLevel;
     var liveScore = (typeof state.score === 'number') ? state.score : 0;
     var stTxt, stCls;
     if (m.conflict) {
-      stTxt = '⏸ CONFLICT'; stCls = 'bad';
-    } else if (setupOk) {
-      stTxt = '✓ SNIPER ON · Setup ' + liveScore; stCls = 'ok';
-    } else if (m.ready) {
-      stTxt = '⚠ MTF OK · sin setup · Setup ' + liveScore; stCls = 'wait';
+      stTxt = '⏸ CONFLICT 1H/15m'; stCls = 'bad';
+    } else if (lvl === 'A' && setupOk) {
+      stTxt = '✓ SNIPER A · ' + liveScore; stCls = 'ok';
+    } else if (lvl === 'B' && setupOk) {
+      stTxt = '◆ SETUP B · ' + liveScore; stCls = 'ok';
+    } else if (lvl === 'C') {
+      stTxt = '○ WATCH C · ' + liveScore; stCls = 'wait';
+    } else if (m.ready || m.softReady) {
+      stTxt = '⚠ MTF ok · sin setup · ' + liveScore; stCls = 'wait';
     } else {
-      stTxt = '… ' + m.aligned + '/4 · Setup ' + liveScore; stCls = 'wait';
+      stTxt = '… ' + m.aligned + '/4 · ' + liveScore; stCls = 'wait';
     }
-    // Nota SMC: no vender en deep discount
-    if (m.macro === 'BEARISH' && m.layers['15m'] && m.layers['15m'].zone === 'DISCOUNT' && !m.ready) {
-      stTxt = '⏳ Wait Premium'; stCls = 'wait';
+    if (m.contraMacro && setupOk) {
+      stTxt += ' · Contra-4H';
     }
-    if (m.macro === 'BULLISH' && m.layers['15m'] && m.layers['15m'].zone === 'PREMIUM' && !m.ready) {
-      stTxt = '⏳ Wait Discount'; stCls = 'wait';
+    // Wait Premium/Discount solo si no hay setup A/B
+    if (!setupOk && m.macro === 'BEARISH' && m.layers['15m'] && m.layers['15m'].zone === 'DISCOUNT') {
+      stTxt = '⏳ Wait Premium · ' + liveScore; stCls = 'wait';
+    }
+    if (!setupOk && m.macro === 'BULLISH' && m.layers['15m'] && m.layers['15m'].zone === 'PREMIUM') {
+      stTxt = '⏳ Wait Discount · ' + liveScore; stCls = 'wait';
     }
     html += '<span class="mtf-status ' + stCls + '">' + stTxt + '</span>';
     el.innerHTML = html;
@@ -3435,7 +3501,7 @@
         }
       }
 
-      if (pb.primary && pb.primary.valid !== false && pb.primary.poi != null) {
+      if (pb.primary && pb.primary.valid !== false && pb.primary.poi != null && (state.score == null || state.score >= 50)) {
         var poi = +pb.primary.poi;
         var tgt = pb.primary.target != null ? +pb.primary.target : null;
         var isLong = state.bias === 'BULLISH' || (pb.primary.shortHint || '').indexOf('comprar') >= 0;
@@ -3791,7 +3857,7 @@
     var lastPx = state.candles.length ? state.candles[state.candles.length - 1].close : 0;
     var atrN = full.atr || 0.001;
     // Gate MTF: solo proyectar E/SL/TP si ≥3/4 TFs alineados y sin conflicto
-    var mtfOk = state.mtf && state.mtf.ready && !state.mtf.conflict;
+    var mtfOk = state.mtf && !state.mtf.conflict && (state.mtf.ready || state.mtf.softReady);
     var dirOk = c.dir && ((state.bias === 'BEARISH' && c.dir === 'SHORT') || (state.bias === 'BULLISH' && c.dir === 'LONG'));
     // Macro bias debe coincidir con dirección
     if (state.mtf && state.mtf.macro && c.dir) {
@@ -3800,7 +3866,7 @@
     }
     var distOk = false;
     // Win-rate filter: usar state.score (ya sincronizado), no el score crudo desactualizado
-    var scoreOk = state.score >= 80;
+    var scoreOk = state.score >= (SMC_CFG.setupMinScoreB || 60);
     if (c.hasSetup && c.entry && lastPx && dirOk && mtfOk && scoreOk) {
       var d = Math.abs(+c.entry - lastPx);
       var isLtfNow = (state.tf === '5m' || state.tf === '15m');
@@ -3841,7 +3907,8 @@
           direction: state.planLevels.direction,
           dir: state.planLevels.direction,
           score: state.score,
-          rr: state.planLevels.rr || (state.smcSetup && state.smcSetup.rr)
+          rr: state.planLevels.rr || (state.smcSetup && state.smcSetup.rr),
+          signalLevel: state.smcSetup && state.smcSetup.signalLevel
         });
       }
     } catch (eN) {}
@@ -5879,32 +5946,35 @@
   function notifySetup(setup) {
     if (!setup || !setup.entry) return;
     var score = setup.score != null ? setup.score : (state.score || 0);
-    var minSc = Math.max(state.alerts && state.alerts.minScore != null ? state.alerts.minScore : 80, 75);
+    var lvl = setup.signalLevel || (state.smcSetup && state.smcSetup.signalLevel) || (score >= 75 ? 'A' : (score >= 60 ? 'B' : null));
+    // Telegram: A siempre (si score ok); B si preferencia minScore <= 65
+    var minSc = (state.alerts && state.alerts.minScore != null) ? state.alerts.minScore : 60;
+    if (lvl === 'C' || !lvl) return;
     if (score < minSc) return;
-    if (setup.rr != null && +setup.rr < 2) return;
-    try {
-      var kz = typeof isInKillzone === 'function' ? isInKillzone() : null;
-      if (kz && !kz.active && score < 90) return;
-    } catch (eK) {}
+    if (lvl === 'B' && score < 60) return;
+    if (lvl === 'A' && score < 70) return;
+    if (setup.rr != null && +setup.rr < 1.5) return;
+    // Killzone ya no bloquea; solo etiqueta
 
-    var key = (state.pair || '') + '|' + (setup.direction || setup.dir || '') + '|' + String(setup.entry);
+    var key = (state.pair || '') + '|' + (setup.direction || setup.dir || '') + '|' + String(setup.entry) + '|' + String(lvl);
     var now = Date.now();
-    if (!state.alerts) state.alerts = { enabled: false, lastSent: {}, minScore: 80, cooldownMs: 900000 };
+    if (!state.alerts) state.alerts = { enabled: false, lastSent: {}, minScore: 60, cooldownMs: 600000 };
     if (!state.alerts.lastSent) state.alerts.lastSent = {};
     var last = state.alerts.lastSent[key] || 0;
     var lastPair = state.alerts.lastSent[state.pair] || 0;
-    if (now - last < (state.alerts.cooldownMs || 900000)) return;
-    if (now - lastPair < 5 * 60 * 1000) return;
+    if (now - last < (state.alerts.cooldownMs || 600000)) return;
+    if (now - lastPair < 4 * 60 * 1000) return;
 
     var dir = setup.direction || setup.dir || '';
     var dec = (typeof priceDecimals === 'function') ? priceDecimals(state.pair) :
       ((state.pair && (state.pair.indexOf('JPY') >= 0 || state.pair === 'XAUUSD')) ? 2 : 5);
     var title = (document.title || 'SMC Oscar') + ' · ' + (state.pair || '') + ' ' + (state.tf || '');
-    var body = (dir === 'SHORT' ? 'SHORT' : dir === 'LONG' ? 'LONG' : 'Setup') +
+    var body = '[' + (lvl === 'A' ? 'SNIPER A' : 'SETUP B') + '] ' +
+      (dir === 'SHORT' ? 'SHORT' : dir === 'LONG' ? 'LONG' : 'Setup') +
       ' | E ' + (+setup.entry).toFixed(dec) +
       ' | SL ' + (+setup.sl).toFixed(dec) +
       ' | TP ' + (+setup.tp).toFixed(dec) +
-      ' | Setup ' + score +
+      ' | Score ' + score +
       (setup.rr ? ' | R:R 1:' + (+setup.rr).toFixed(1) : '');
 
     if (state.alerts.enabled && 'Notification' in window && Notification.permission === 'granted') {
@@ -5914,8 +5984,11 @@
       } catch (eN) {}
     }
     if (state.telegram && state.telegram.enabled) {
+      var mtfNote = state.mtf && state.mtf.conflict ? 'MTF conflicto' :
+        (state.mtf && (state.mtf.ready || state.mtf.softReady) ? 'MTF ok' : 'MTF parcial');
       var tgMsg = title + ' | ' + body + ' | Bias: ' + (state.bias || '-') +
-        (state.mtf && state.mtf.ready ? ' | MTF OK' : ' | MTF pending');
+        ' | ' + mtfNote +
+        (state.mtf && state.mtf.contraMacro ? ' | ⚠️ Contra-4H' : '');
       sendTelegram(tgMsg).catch(function(){});
     }
     state.alerts.lastSent[key] = now;

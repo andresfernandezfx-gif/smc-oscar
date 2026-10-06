@@ -353,6 +353,7 @@ async function run() {
         ' ' +
         TIMEFRAME +
         '\n' +
+        '[' + (sig.score >= 75 ? 'SNIPER A' : 'SETUP B') + '] ' +
         (sig.dir === 'LONG' ? 'LONG' : 'SHORT') +
         ' | E ' +
         fmt(pair, sig.entry) +
